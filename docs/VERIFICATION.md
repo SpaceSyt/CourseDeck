@@ -1,5 +1,28 @@
 # Verification record
 
+## Gmail pagination and cache integrity · 2026-09-12
+
+This supersedes the older latest-30-thread limit recorded below. The dedicated
+signed-in browser was used to traverse 19 Inbox pages. All 926 reference thread
+IDs matched the resulting local header cache, without missing or extra IDs in
+that comparison. Existing local mail actions were unchanged. Verification-only
+header backfill used zero body reads; normal runs used the production eight-body
+budget per page. Normal runs also verified continued historical checkpoints and
+body reads after the header phase. The local service was restarted and its
+heartbeat returned connected.
+
+This is an Inbox header comparison for one account, not proof of complete
+conversation bodies, every Gmail category, archived mail or attachments. Unread
+cached bodies remain explicitly reported. Empty-inbox behavior was verified with
+synthetic browser fixtures only; the real mailbox was not emptied.
+
+Regression fixtures cover hidden old rows, delayed navigation back to page one,
+native disabled pagination, unknown page ranges, missing/duplicate identities,
+persisted checkpoints, fair retry, body timeouts and local-state preservation.
+Stale retained text is excluded from current classification and automatic
+association evidence. All 538 backend tests and 22 frontend tests passed, as did
+browser UI smoke, the frontend build, formatting, lint and generated contracts.
+
 ## Publication checks · 2026-09-12
 
 492 backend tests and 22 frontend tests passed locally. Ruff, generated task contracts,

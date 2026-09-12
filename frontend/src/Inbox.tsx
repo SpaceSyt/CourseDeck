@@ -377,7 +377,13 @@ export function Inbox({
               Create rule
             </button>
           </div>
-          {!selected.body_complete && <p className="inbox-error">Email content incomplete</p>}
+          {!selected.body_complete && (
+            <p className="inbox-error">
+              {selected.body_stale
+                ? 'Cached body; latest content unread.'
+                : 'Email content incomplete'}
+            </p>
+          )}
           <div className="mail-body">
             {linkedText(selected.body || selected.snippet || 'No text content')}
           </div>

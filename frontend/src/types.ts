@@ -128,6 +128,8 @@ export interface MailMessage {
   snippet: string;
   body?: string;
   body_complete: boolean;
+  body_checked_at?: string | null;
+  body_stale?: boolean;
   received_at: string | null;
   date_label: string;
   date_text: string;

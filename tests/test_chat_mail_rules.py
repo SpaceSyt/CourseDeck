@@ -95,6 +95,35 @@ async def test_stale_preview_and_target_ambiguity_cannot_write(tmp_path):
         await tools.run("preview_mail_rule_edit", {})
 
 
+async def test_rule_preview_does_not_treat_stale_body_as_current_evidence(tmp_path):
+    service = await configured(tmp_path, lambda _: reply())
+    store = MailStore(service.db)
+    store.upsert(
+        MailMessage(
+            id="stale-mail",
+            sender="PRIVATE SENDER",
+            subject="Old thread",
+            body="PRIVATE NEWSLETTER",
+            body_complete=True,
+            content_key="text-links-v1:old",
+        )
+    )
+    store.upsert(
+        MailMessage(
+            id="stale-mail",
+            sender="PRIVATE SENDER",
+            subject="New reply",
+            content_key="text-links-v1:new",
+        )
+    )
+    tools = MailRuleTools(service, 'Add mail rule: body contains "NEWSLETTER" -> ignore')
+    preview = await tools.run("preview_mail_rule_edit", {})
+    assert preview["counts"]["incomplete"] == 1
+    assert preview["counts"]["newly_ignored"] == 0
+    assert "PRIVATE" not in json.dumps(preview)
+    assert store.get("stale-mail")["body"] == "PRIVATE NEWSLETTER"
+
+
 async def test_keyword_update_enable_disable_delete_and_manual_choices(tmp_path):
     service = await configured(tmp_path, lambda _: reply())
     store = MailStore(service.db)

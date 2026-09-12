@@ -208,6 +208,11 @@ class AssociationStore:
             course = scope(item.get("course_id"))
             title = item.get("title", item.get("subject", ""))
             status = item.get("submission_status", "")
+            body = item.get("description", item.get("body", ""))
+            if kind == "mail" and item.get("body_stale"):
+                # Retained text is available in Inbox, but cannot establish a new
+                # current association after the Gmail thread has changed.
+                body = ""
             if kind == "mail":
                 status = (
                     "Deleted"
@@ -234,11 +239,17 @@ class AssociationStore:
                 "status": status or "unknown",
                 "enabled": course in active_courses if course else kind != "document",
                 "complete": item.get("complete", item.get("body_complete")),
+                **(
+                    {
+                        "body_stale": bool(item.get("body_stale")),
+                        "body_checked_at": item.get("body_checked_at"),
+                    }
+                    if kind == "mail"
+                    else {}
+                ),
                 "source_modified_at": item.get("source_modified_at"),
                 "fetched_at": item.get("fetched_at"),
-                "_body": item.get("description", item.get("body", ""))
-                + "\n"
-                + item.get("snippet", ""),
+                "_body": body + "\n" + item.get("snippet", ""),
                 "_source_task_id": item.get("source_task_id"),
                 "_email_id": item.get("email_id"),
                 "_stable_id": (item.get("provider"), item.get("external_id")),

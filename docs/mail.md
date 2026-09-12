@@ -5,12 +5,24 @@ Inbox → Connect Gmail, complete school SSO, then choose Finish login. No OAuth
 project or AI service is required. The account is fixed after the first connection;
 connecting a different account is rejected to prevent mixing cached mail.
 
-The first browser adapter reads up to 30 threads from the current inbox page.
+Each sync caches all visible headers on the latest inbox page and one historical
+page, then attempts up to eight conversation bodies per page. The historical
+page checkpoint survives restarts and cycles back after the last verified page.
+Read attempts rotate so a failing conversation cannot permanently block others.
+Both pages' headers are committed before body reads; each page's body work has
+an independent time budget. Unknown pagination leaves the checkpoint unchanged.
 It syncs on startup when enabled, every five minutes while running, and through
-Inbox → ⋯ → Sync mail. Older inbox pages, archived mail, attachments and sending
-are not supported in this version. Gmail DOM changes may require adapter updates.
-The adapter has fixture coverage and has read 30 threads from one NYU Gmail
-account. Opening threads to read their body can mark them read in Gmail.
+Inbox → ⋯ → Sync mail. Archived mail, attachments and sending are not supported.
+This covers the displayed Inbox list, not every mailbox folder or alternate
+category/view. Gmail DOM changes may require adapter updates.
+Opening threads to read their body can mark them read in Gmail.
+
+Dates come from the source's full timestamp; unrecognized dates retain their
+previous order or sort below existing mail and produce a coverage warning.
+Changed or unreadable conversations retain cached text with an incomplete/stale
+indicator. Stale text does not establish current classifications or automatic
+task associations. The status reports unread cached bodies separately from
+listed headers; successfully visiting every page does not prove complete bodies.
 
 Mail deletion, starring, restoring ignored mail and course overrides only change
 the local database. Disconnect removes the dedicated browser session, retaining

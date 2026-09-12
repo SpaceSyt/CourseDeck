@@ -20,7 +20,8 @@ async def test_browser_sync_caches_threads_and_keeps_local_deletion(tmp_path):
         <div class="a3s" style="display:none">Previously viewed email</div>
         <main role="main"><table><tr class="zA zE"><td class="yW">
         <span email="teacher@example.test" name="Instructor">Instructor</span></td>
-        <td><span class="bog" data-legacy-thread-id="123" onclick="readThread()">Survey</span>
+        <td><span class="bog" data-legacy-thread-id="123" data-legacy-last-message-id="m1"
+        onclick="readThread()">Survey</span>
         <span class="y2"> - Please complete the survey.</span></td><td class="xW">
         <span title="Sep 8, 2026, 13:21">13:21</span></td></tr></table></main>"""
         html += """<script>

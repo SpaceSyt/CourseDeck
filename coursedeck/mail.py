@@ -32,6 +32,8 @@ class MailMessage(BaseModel):
     snippet: str = Field(default="", max_length=2000)
     body: str = Field(default="", max_length=500000)
     body_complete: bool = False
+    body_checked_at: AwareDatetime | None = None
+    body_stale: bool = False
     received_at: AwareDatetime | None = None
     date_label: str = Field(default="", max_length=200)
     date_text: str = Field(default="", max_length=100)
@@ -125,11 +127,12 @@ def matches(needle, haystack):
 
 
 def mail_fields(mail):
-    text = " ".join([mail["subject"], mail["snippet"], mail["body"]])
+    body = "" if mail.get("body_stale") else mail["body"]
+    text = " ".join([mail["subject"], mail["snippet"], body])
     return {
         "sender": mail["sender_email"] or mail["sender"],
         "subject": mail["subject"],
-        "body": mail["body"],
+        "body": body,
         "any": text + " " + mail["sender_email"],
     }
 
@@ -226,19 +229,53 @@ class MailStore:
 
     def upsert(self, message: MailMessage, sort_at=None):
         with self.db.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             old = conn.execute(
                 "SELECT payload FROM mail_messages WHERE id=?", (message.id,)
             ).fetchone()
             payload = message.model_dump(mode="json")
-            if old and not message.body_complete:
+            if old:
                 previous = json.loads(old[0])
-                if (
-                    previous.get("body_complete")
-                    and previous["snippet"] == message.snippet
-                    and previous["date_label"] == message.date_label
-                    and previous.get("content_key", "") == message.content_key
-                ):
-                    payload.update(body=previous["body"], body_complete=True)
+                attempted = payload["body_checked_at"] is not None and payload[
+                    "body_checked_at"
+                ] != previous.get("body_checked_at")
+                if message.body_checked_at is None:
+                    payload["body_checked_at"] = previous.get("body_checked_at")
+                if not message.body_complete and not message.body:
+                    key = message.content_key
+                    unchanged = (
+                        bool(key.partition(":")[2].strip())
+                        and previous.get("content_key") == key
+                        and all(
+                            previous.get(field) == payload[field]
+                            for field in (
+                                "subject",
+                                "snippet",
+                                "date_label",
+                                "received_at",
+                            )
+                        )
+                    )
+                    confirmed = (
+                        unchanged
+                        and previous.get("body_complete")
+                        and not previous.get("body_stale")
+                        and not message.body_stale
+                        and not attempted
+                    )
+                    payload.update(
+                        body=previous.get("body", ""),
+                        body_complete=bool(confirmed),
+                        body_stale=bool(previous.get("body"))
+                        and (
+                            bool(previous.get("body_stale"))
+                            or not unchanged
+                            or attempted
+                            or message.body_stale
+                        ),
+                    )
+            if message.body_complete:
+                payload["body_stale"] = False
             stamp = (
                 message.received_at.isoformat()
                 if message.received_at
@@ -415,7 +452,8 @@ class MailStore:
     def classify(self, mail, local, courses=None, rules=None):
         courses = self.db.courses() if courses is None else courses
         rules = self.rules() if rules is None else rules
-        text = " ".join([mail["subject"], mail["snippet"], mail["body"]])
+        fields = mail_fields(mail)
+        text = " ".join([mail["subject"], mail["snippet"], fields["body"]])
         hits, reasons, categories, attention = set(), [], set(), []
         ignore, explicit_none, uncertain = False, False, False
         for course in courses:
@@ -425,7 +463,6 @@ class MailStore:
                 if len(normalized(name)) >= 4 and matches(name, text):
                     hits.add(course["id"])
                     reasons.append(name)
-        fields = mail_fields(mail)
         for rule in rules:
             if not rule.get("enabled", True):
                 continue

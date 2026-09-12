@@ -1,3 +1,6 @@
+import json
+
+import pytest
 from fastapi.testclient import TestClient
 
 from coursedeck.app import create_app
@@ -151,8 +154,10 @@ def test_existing_custom_rules_are_preserved_when_defaults_are_first_seeded(tmp_
 
 def test_changed_thread_never_reuses_stale_body_for_classification(tmp_path):
     _, store, _ = setup(tmp_path)
-    store.upsert(message(snippet="old"))
-    store.upsert(message(snippet="old", body="", body_complete=False))
+    store.upsert(message(snippet="old", content_key="text-links-v1:first"))
+    store.upsert(
+        message(snippet="old", content_key="text-links-v1:first", body="", body_complete=False)
+    )
     assert store.get("one")["body_complete"]
     store.upsert(message(snippet="new", body="", body_complete=False))
     assert not store.get("one")["body_complete"]
@@ -160,6 +165,122 @@ def test_changed_thread_never_reuses_stale_body_for_classification(tmp_path):
     store.upsert(message("thread", content_key="old"))
     store.upsert(message("thread", content_key="new", body="", body_complete=False))
     assert not store.get("thread")["body_complete"]
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"content_key": "text-links-v1:second"},
+        {"content_key": "text-links-v1:"},
+        {"content_key": ""},
+        {"subject": "New subject"},
+        {"snippet": "New reply"},
+        {"date_label": "Sep 12, 2026"},
+        {"received_at": "2026-09-12T14:00:00Z"},
+        {"body_checked_at": "2026-09-12T15:00:00Z"},
+        {"body_stale": True},
+    ],
+)
+def test_changed_or_failed_read_keeps_cache_without_claiming_complete(tmp_path, changed):
+    db, store, _ = setup(tmp_path)
+    base = {
+        "content_key": "text-links-v1:first",
+        "subject": "Campus notice",
+        "snippet": "Hello",
+        "date_label": "Sep 11, 2026",
+        "received_at": "2026-09-11T14:00:00Z",
+        "body_checked_at": "2026-09-11T15:00:00Z",
+    }
+    store.upsert(message(body="Old survey text", **base))
+    store.patch(
+        "one",
+        {"deleted": True, "ignored": False, "starred": True, "read": True, "course_id": "none"},
+    )
+    with db.connection() as conn:
+        original_local = conn.execute(
+            "SELECT local_payload FROM mail_messages WHERE id='one'"
+        ).fetchone()[0]
+    update = base | {"body": "", "body_complete": False, "body_checked_at": None} | changed
+    store.upsert(message(**update))
+    cached = store.get("one")
+    assert cached["body"] == "Old survey text"
+    assert cached["body_stale"] and not cached["body_complete"]
+    assert cached["categories"] == [] and not cached["attention"]
+    assert cached["body_checked_at"] == changed.get("body_checked_at", base["body_checked_at"])
+    with db.connection() as conn:
+        assert (
+            conn.execute("SELECT local_payload FROM mail_messages WHERE id='one'").fetchone()[0]
+            == original_local
+        )
+    assert cached["deleted"] and cached["starred"] and not cached["unread"]
+
+
+def test_header_refresh_preserves_check_time_only_real_key_can_confirm_cached_body(tmp_path):
+    _, store, _ = setup(tmp_path)
+    checked = "2026-09-11T15:00:00Z"
+    for key in ["", "text-links-v1:", "text-links-v1:first"]:
+        store.upsert(message(key or "empty", content_key=key, body_checked_at=checked))
+        store.upsert(message(key or "empty", content_key=key, body="", body_complete=False))
+        cached = store.get(key or "empty")
+        assert cached["body_checked_at"] == checked
+        assert cached["body_complete"] == (key == "text-links-v1:first")
+        assert cached["body_stale"] == (key != "text-links-v1:first")
+
+
+def test_partial_body_replaces_stale_cache_then_full_read_restores_current_body(tmp_path):
+    _, store, _ = setup(tmp_path)
+    key = "text-links-v1:first"
+    store.upsert(
+        message(content_key=key, body="Original body", body_checked_at="2026-09-11T15:00:00Z")
+    )
+    store.upsert(
+        message(
+            content_key=key, body="", body_complete=False, body_checked_at="2026-09-12T15:00:00Z"
+        )
+    )
+    assert store.get("one")["body_stale"]
+    store.upsert(
+        message(
+            content_key=key,
+            body="Current partial body",
+            body_complete=False,
+            body_checked_at="2026-09-12T15:00:00Z",
+        )
+    )
+    partial = store.get("one")
+    assert partial["body"] == "Current partial body"
+    assert not partial["body_complete"] and not partial["body_stale"]
+    store.upsert(message(content_key=key, body="", body_complete=False))
+    assert not store.get("one")["body_stale"] and not store.get("one")["body_complete"]
+    store.upsert(
+        message(
+            content_key=key,
+            body="Current full body",
+            body_complete=True,
+            body_checked_at="2026-09-12T15:01:00Z",
+        )
+    )
+    store.upsert(message(content_key=key, body="", body_complete=False))
+    fresh = store.get("one")
+    assert (
+        fresh["body"] == "Current full body" and fresh["body_complete"] and not fresh["body_stale"]
+    )
+    assert fresh["body_checked_at"] == "2026-09-12T15:01:00Z"
+
+
+def test_read_attempt_is_persisted_before_body_and_survives_reopening(tmp_path):
+    db, store, _ = setup(tmp_path)
+    store.upsert(message(body="Original body", body_checked_at="2026-09-11T15:00:00Z"))
+    store.upsert(message(body="", body_complete=False, body_checked_at="2026-09-12T15:00:00Z"))
+    with db.connection() as conn:
+        payload = json.loads(
+            conn.execute("SELECT payload FROM mail_messages WHERE id='one'").fetchone()[0]
+        )
+    assert payload["body_checked_at"] == "2026-09-12T15:00:00Z"
+    assert payload["body"] == "Original body" and payload["body_stale"]
+    reopened = MailStore(Database(tmp_path / "coursedeck.sqlite3"))
+    reopened.upsert(message(body="", body_complete=False))
+    assert reopened.get("one")["body_checked_at"] == payload["body_checked_at"]
 
 
 def test_custom_tasks_survive_lms_sync_binding_and_mail_deletion(tmp_path):

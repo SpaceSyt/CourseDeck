@@ -470,6 +470,65 @@ def test_unclassified_mail_multiple_explicit_assignments_do_not_infer_course(set
     assert not any(r["target"]["id"] == "ambiguous" for r in store.view(tasks[0].id)["relations"])
 
 
+def test_stale_mail_body_does_not_supply_current_association_evidence(setup):
+    _, _, mail, _, tasks, store = setup
+    mail.upsert(
+        MailMessage(
+            id="changed-thread",
+            sender="Teacher",
+            subject="Reminder",
+            body=tasks[0].url,
+            body_complete=True,
+            content_key="text-links-v1:old",
+            body_checked_at="2026-09-11T12:00:00Z",
+        )
+    )
+    original = next(
+        r for r in store.view(tasks[0].id)["relations"] if r["target"]["id"] == "changed-thread"
+    )
+    assert original["active"]
+    mail.upsert(
+        MailMessage(
+            id="changed-thread",
+            sender="Teacher",
+            subject="New reminder",
+            content_key="text-links-v1:new",
+            body_checked_at="2026-09-12T12:00:00Z",
+        )
+    )
+    stale = next(
+        r for r in store.view(tasks[0].id)["relations"] if r["target"]["id"] == "changed-thread"
+    )
+    assert not stale["active"]
+    assert stale["target"]["body_stale"] and not stale["target"]["complete"]
+    assert stale["target"]["body_checked_at"] == "2026-09-12T12:00:00Z"
+    assert "_body" not in stale["target"] and "body" not in stale["target"]
+    assert mail.get("changed-thread")["body"] == tasks[0].url
+    # User-confirmed links remain deliberate, with their incomplete content visible.
+    store.decide(tasks[0].id, "mail", "changed-thread", "link")
+    retained = next(
+        r for r in store.view(tasks[0].id)["relations"] if r["target"]["id"] == "changed-thread"
+    )
+    assert retained["active"] and retained["target"]["body_stale"]
+    mail.upsert(
+        MailMessage(
+            id="changed-thread",
+            sender="Teacher",
+            subject="New reminder",
+            body=tasks[1].url,
+            body_complete=True,
+            content_key="text-links-v1:new",
+            body_checked_at="2026-09-12T12:01:00Z",
+        )
+    )
+    current = next(
+        r for r in store.view(tasks[1].id)["relations"] if r["target"]["id"] == "changed-thread"
+    )
+    assert (
+        current["active"] and current["target"]["complete"] and not current["target"]["body_stale"]
+    )
+
+
 def test_brightspace_content_home_preserves_type_and_item_identity():
     prefix = "https://school.edu/d2l/le/content/1/Home?itemIdentifier=D2L.LE.Content.ContentObject."
     topic = source_identity(prefix + "TopicCO-123")
