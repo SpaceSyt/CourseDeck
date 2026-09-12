@@ -33,10 +33,17 @@ def assignment_timing(body: str, course_id: str, assignment_id: str, title: str)
                     and len(timing) >= 3
                 ):
                     stamp = timing[0]
-                    # A missing timestamp is not assumed to mean "no deadline".
-                    if type(stamp) is int and 631152000000 <= stamp < 7258118400000:
+                    # The complete page record's explicit false due-date flag
+                    # was verified against its visible "No due date" label.
+                    # A null timestamp alone (including true/unknown flags) still
+                    # means unreadable, never an instruction to clear a deadline.
+                    no_due_date = stamp is None and timing[2] is False
+                    valid_stamp = type(stamp) is int and 631152000000 <= stamp < 7258118400000
+                    if no_due_date or valid_stamp:
                         return {
-                            "due_at": datetime.fromtimestamp(stamp / 1000, UTC),
+                            "due_at": None
+                            if no_due_date
+                            else datetime.fromtimestamp(stamp / 1000, UTC),
                             "source_updated_at": datetime.fromtimestamp(header[2] / 1000, UTC)
                             if type(header[2]) is int and 631152000000 <= header[2] < 7258118400000
                             else None,

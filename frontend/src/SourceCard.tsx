@@ -57,6 +57,12 @@ export function SourceCard({
     : s.status === 'connected' && s.last_outcome && s.last_outcome !== 'success'
       ? s.last_outcome.replaceAll('_', ' ')
       : s.status.replaceAll('_', ' ');
+  const diagnostic = s.metadata?.diagnostics;
+  const stageNames: Record<string, string> = {
+    source_read: 'Source records',
+    materials_read: 'Materials',
+    snapshot_apply: 'Save snapshot',
+  };
   return (
     <article className="source-card" id={`source-${s.key}`}>
       <div className="source-title">
@@ -67,6 +73,17 @@ export function SourceCard({
       </div>
       <h2>{s.name}</h2>
       {s.last_attempted_sync && <small>Last attempt · {date(s.last_attempted_sync)}</small>}
+      {diagnostic?.stage && stageNames[diagnostic.stage] && (
+        <small>
+          {s.syncing ? 'Reading' : 'Last stage'} · {stageNames[diagnostic.stage]}
+        </small>
+      )}
+      {diagnostic?.next_retry_at && (
+        <small>
+          Retry {(diagnostic.retry_attempt ?? 0) + 1}/{diagnostic.retry_limit} ·{' '}
+          {date(diagnostic.next_retry_at)}
+        </small>
+      )}
       {s.warnings?.map((warning, i) => (
         <div className="warning" key={i}>
           {warning}

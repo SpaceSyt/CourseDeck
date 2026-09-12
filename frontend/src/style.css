@@ -232,16 +232,6 @@ nav {
 .dot.brightspace {
   background: #977fae;
 }
-.tiny-status {
-  margin-left: auto;
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: #d7dcd9;
-}
-.tiny-status.online {
-  background: #65a17b;
-}
 .privacy {
   margin-top: auto;
   border: 1px solid #e5ebe6;
@@ -549,6 +539,51 @@ h2 {
 }
 .task-row:hover {
   border-color: #afc8b8;
+}
+.task-row.exiting {
+  animation: task-exit 260ms ease-in forwards;
+  pointer-events: none;
+}
+.task-title-copy {
+  min-width: 0;
+}
+.task-title-text {
+  background-image: linear-gradient(currentColor, currentColor);
+  background-position: left 54%;
+  background-size: 0 1px;
+  background-repeat: no-repeat;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+.completing .task-title-text {
+  animation: task-strike 320ms ease-out forwards;
+}
+.done .task-title-text {
+  background-size: 100% 1px;
+}
+.task-source-warning {
+  font-size: 12px;
+  line-height: 1.4;
+}
+@keyframes task-strike {
+  to {
+    background-size: 100% 1px;
+  }
+}
+@keyframes task-exit {
+  to {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .task-row.exiting,
+  .completing .task-title-text {
+    animation: none;
+  }
+  .completing .task-title-text {
+    background-size: 100% 1px;
+  }
 }
 .checkbox {
   width: 17px;
@@ -916,6 +951,8 @@ h2 {
 }
 .course-card {
   position: relative;
+  display: flex;
+  flex-direction: column;
 }
 .course-card > small {
   color: #97a69a;
@@ -924,12 +961,17 @@ h2 {
 .course-card h2 {
   margin-top: 9px;
 }
-.course-card p {
+.course-card .course-code {
   font-size: 11px;
   color: #9fa89f;
   margin: 12px 0 28px;
+  min-height: 1.5em;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 .course-card footer {
+  margin-top: auto;
+  align-items: center;
   border-top: 1px solid #edf0ed;
   padding-top: 15px;
   display: flex;
@@ -939,8 +981,18 @@ h2 {
   font-size: 11px;
   color: #879b8c;
 }
+.course-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  flex: 3 1 auto;
+  min-width: 0;
+}
 .course-card footer a {
   display: flex;
+  flex: 1 0 auto;
+  justify-content: flex-end;
   align-items: center;
   gap: 4px;
 }

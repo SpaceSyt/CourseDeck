@@ -1,0 +1,33 @@
+.recovery-settings {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  gap: 14px;
+}
+
+.recovery-settings > h2,
+.recovery-settings > p {
+  margin: 0;
+}
+
+.recovery-settings > button {
+  justify-self: start;
+}
+
+.recovery-settings > label {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.recovery-settings select {
+  width: min(100%, 32rem);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.recovery-settings p {
+  overflow-wrap: anywhere;
+}

@@ -27,6 +27,7 @@ def test_migration_and_binding_preserve_source_identity_and_local_edits(tmp_path
     with sqlite3.connect(db.path) as con:
         con.execute("DROP TABLE workspace_courses")
         con.execute("PRAGMA user_version=1")
+        con.execute("DROP TABLE schema_migrations")
     db = Database(db.path)
     local_id = db.add_course("My course name", course.provider, None)
     assert next(c for c in db.courses() if c["id"] == local_id)["needs_binding"]

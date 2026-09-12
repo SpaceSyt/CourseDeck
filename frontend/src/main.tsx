@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Archive,
-  ArrowDownToLine,
+  Bell,
   ArrowUpRight,
   BookOpen,
   Check,
@@ -17,6 +17,7 @@ import {
   Link2,
   Loader2,
   Mail,
+  MessageSquare,
   Pin,
   Plus,
   RefreshCw,
@@ -24,15 +25,21 @@ import {
   Settings2,
   X,
 } from 'lucide-react';
-import type { Course, LocalState, MailMessage, Settings, Snapshot, SyncLog, Task } from './types';
+import type { Course, LocalState, MailMessage, Settings, SyncLog, Task } from './types';
 import { SourceCard, type Action } from './SourceCard';
-import { bucket, completed, dayKey, dayNumber } from './tasks';
+import { bucket, completed, dayKey, dayNumber, sourceWarning } from './tasks';
 import { useHeartbeat } from './useHeartbeat';
+import { useWorkspaceSnapshot } from './useWorkspaceSnapshot';
 import { CourseDialog } from './CourseDialog';
 import { TaskDialog } from './TaskDialog';
 import { Inbox } from './Inbox';
+import { AISettings, Chat } from './Chat';
+import { Changes } from './Changes';
+import { TaskRelations } from './TaskRelations';
+import { TaskHistory } from './TaskHistory';
+import { RecoverySettings } from './RecoverySettings';
 import { api } from './api';
-import { courseColor, sourceColors } from './colors';
+import { courseColor, sourceSyncStatus } from './colors';
 import './style.css';
 import './dark.css';
 import './inbox.css';
@@ -45,8 +52,13 @@ const names: Record<string, string> = {
 };
 const safeUrl = (url: string | null) => (url && /^https?:\/\//i.test(url) ? url : undefined);
 function App() {
-  const [data, setData] = useState<Snapshot | null>(null);
+  const { data, setData, offline, recoveryRequired, load } = useWorkspaceSnapshot();
   const [page, setPage] = useState('Todo');
+  const [chatTarget, setChatTarget] = useState<{
+    courseId?: string;
+    taskId?: string;
+    documentId?: string;
+  }>({});
   const [query, setQuery] = useState('');
   const [provider, setProvider] = useState('all');
   const [courseFilter, setCourseFilter] = useState('all');
@@ -60,27 +72,18 @@ function App() {
   const [view, setView] = useState('active');
   const [selected, setSelected] = useState<string | null>(null);
   const [message, setMessage] = useState('');
-  const [offline, setOffline] = useState(false);
   const [busy, setBusy] = useState(false);
   const [logs, setLogs] = useState<SyncLog[]>([]);
   const [clock, setClock] = useState(new Date());
+  const [completion, setCompletion] = useState<{
+    task: Task;
+    phase: 'striking' | 'exiting';
+  } | null>(null);
+  const completing = useRef(false);
   const mounted = useRef(true);
-  const load = async () => {
-    try {
-      const value = await api<Snapshot>('/snapshot');
-      if (mounted.current) {
-        setData(value);
-        setOffline(false);
-      }
-    } catch {
-      if (mounted.current) setOffline(true);
-    }
-  };
   useEffect(() => {
     mounted.current = true;
-    void load();
     const timer = setInterval(() => {
-      void load();
       setClock(new Date());
     }, 3000);
     return () => {
@@ -131,6 +134,47 @@ function App() {
   };
   const update = (task: Task, patch: Partial<LocalState>) =>
     action(`/tasks/${encodeURIComponent(task.id)}/local`, 'PATCH', patch);
+  const toggleComplete = async (task: Task) => {
+    if (completing.current) return;
+    if (task.local.dismissed || task.local.completion_override === 'done')
+      return update(task, { dismissed: false });
+    completing.current = true;
+    setBusy(true);
+    setMessage('');
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const pause = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+    setCompletion({ task, phase: 'striking' });
+    try {
+      await Promise.all([
+        api(`/tasks/${encodeURIComponent(task.id)}/local`, 'PATCH', { dismissed: true }),
+        pause(reducedMotion ? 0 : 320),
+      ]);
+      if (!mounted.current) return;
+      setData((current) =>
+        current
+          ? {
+              ...current,
+              tasks: current.tasks.map((t) =>
+                t.id === task.id
+                  ? { ...t, local: { ...t.local, dismissed: true, completion_override: null } }
+                  : t,
+              ),
+            }
+          : current,
+      );
+      void load();
+      setCompletion({ task, phase: 'exiting' });
+      await pause(reducedMotion ? 0 : 260);
+    } catch (error) {
+      if (mounted.current) setMessage((error as Error).message);
+    } finally {
+      completing.current = false;
+      if (mounted.current) {
+        setCompletion(null);
+        setBusy(false);
+      }
+    }
+  };
   const zone = data?.settings.timezone ?? 'America/New_York';
   const date = (value: string | null, full = false) =>
     value
@@ -158,7 +202,11 @@ function App() {
       (courseFilter === 'all' || t.course_id === courseFilter),
   );
   const sync = data?.sources.some((s) => s.syncing);
-  const filtered = (data?.tasks ?? [])
+  // Preserve the row during polling and the save so its exit is never cut short.
+  const visibleTasks = (data?.tasks ?? []).map((t) =>
+    t.id === completion?.task.id ? completion.task : t,
+  );
+  const filtered = visibleTasks
     .filter((t) => {
       const relevant =
         view === 'hidden'
@@ -169,6 +217,7 @@ function App() {
       return (
         courseEnabled(t) &&
         relevant &&
+        (view !== 'done' || completed(t)) &&
         (view !== 'active' || data?.settings.show_completed || !completed(t)) &&
         (provider === 'all' ||
           t.provider === provider ||
@@ -202,7 +251,9 @@ function App() {
         </a>
         <nav>
           {[
+            { name: 'Chat', icon: MessageSquare },
             { name: 'Todo', icon: LayoutList },
+            { name: 'Changes', icon: Bell },
             { name: 'Courses', icon: BookOpen },
             { name: 'Sources', icon: Link2 },
             { name: 'Settings', icon: Settings2 },
@@ -212,6 +263,7 @@ function App() {
               className={`nav-item ${page === name ? 'selected' : ''}`}
               onClick={() => {
                 setPage(name);
+                if (name === 'Chat') setChatTarget({});
                 setCourseFilter('all');
                 setProvider('all');
                 setQuery('');
@@ -220,6 +272,9 @@ function App() {
               <Icon size={19} />
               {name}
               {name === 'Todo' && <span className="nav-count">{active.length}</span>}
+              {name === 'Changes' && !!data?.changes?.unread_count && (
+                <span className="nav-count">{data.changes.unread_count}</span>
+              )}
             </button>
           ))}
         </nav>
@@ -265,30 +320,38 @@ function App() {
         </div>
         <div className="source-nav">
           <span className="nav-label">SOURCES</span>
-          {data?.sources.map((s) => (
-            <button
-              key={s.key}
-              onClick={() => {
-                setProvider(s.key);
-                setCourseFilter('all');
-                setPage('Sources');
-                window.setTimeout(
-                  () =>
-                    document
-                      .getElementById(`source-${s.key}`)
-                      ?.scrollIntoView({ behavior: 'smooth', block: 'center' }),
-                  0,
-                );
-              }}
-            >
-              <i className="dot" style={{ backgroundColor: sourceColors[s.key] }} />
-              {names[s.key] ?? s.name}
-              <span className={`tiny-status ${s.status === 'connected' ? 'online' : ''}`} />
-            </button>
-          ))}
+          {data?.sources.map((s) => {
+            const syncStatus = sourceSyncStatus(s);
+            return (
+              <button
+                key={s.key}
+                title={`${names[s.key] ?? s.name} · ${syncStatus.label}`}
+                aria-label={`${names[s.key] ?? s.name}: ${syncStatus.label}`}
+                onClick={() => {
+                  setProvider(s.key);
+                  setCourseFilter('all');
+                  setPage('Sources');
+                  window.setTimeout(
+                    () =>
+                      document
+                        .getElementById(`source-${s.key}`)
+                        ?.scrollIntoView({ behavior: 'smooth', block: 'center' }),
+                    0,
+                  );
+                }}
+              >
+                <i
+                  className="dot"
+                  style={{ backgroundColor: syncStatus.color }}
+                  aria-hidden="true"
+                />
+                {names[s.key] ?? s.name}
+              </button>
+            );
+          })}
         </div>
       </aside>
-      <main>
+      <main className={page === 'Chat' ? 'chat-page' : undefined}>
         <header className="topbar">
           <div>
             <span
@@ -320,59 +383,67 @@ function App() {
         <div
           className={`workspace-body ${page === 'Todo' ? 'has-inbox' : ''} ${inboxVisible ? 'mail-visible' : ''}`}
         >
-          <div className={`content ${page === 'Todo' ? 'content-todo' : ''}`}>
-            <div className="page-heading">
-              <div>
-                <div className="eyebrow">
-                  {new Intl.DateTimeFormat('en-US', {
-                    timeZone: zone,
-                    weekday: 'long',
-                    month: 'long',
-                    day: 'numeric',
-                  }).format(clock)}
+          <div
+            className={`content ${page === 'Todo' ? 'content-todo' : page === 'Chat' ? 'content-chat' : ''}`}
+          >
+            {page !== 'Chat' && (
+              <div className="page-heading">
+                <div>
+                  <div className="eyebrow">
+                    {new Intl.DateTimeFormat('en-US', {
+                      timeZone: zone,
+                      weekday: 'long',
+                      month: 'long',
+                      day: 'numeric',
+                    }).format(clock)}
+                  </div>
+                  <h1>
+                    {page === 'Todo'
+                      ? courseFilter !== 'all'
+                        ? (data?.courses.find((c) => c.id === courseFilter)?.name ?? 'Assignments')
+                        : 'Assignments'
+                      : page === 'Courses'
+                        ? 'Courses'
+                        : page === 'Sources'
+                          ? 'Sources'
+                          : page}
+                  </h1>
                 </div>
-                <h1>
-                  {page === 'Todo'
-                    ? courseFilter !== 'all'
-                      ? (data?.courses.find((c) => c.id === courseFilter)?.name ?? 'Assignments')
-                      : 'Assignments'
-                    : page === 'Courses'
-                      ? 'Courses'
-                      : page === 'Sources'
-                        ? 'Sources'
-                        : 'Settings'}
-                </h1>
+                {page !== 'Settings' && (
+                  <div className="page-actions">
+                    {page === 'Todo' && (
+                      <>
+                        <button className="inbox-toggle" onClick={() => setInboxVisible(true)}>
+                          <Mail size={16} />
+                          Inbox
+                        </button>
+                        <button
+                          className="primary"
+                          disabled={!data}
+                          onClick={() => setTaskDialog({})}
+                        >
+                          <Plus size={16} />
+                          Add task
+                        </button>
+                      </>
+                    )}
+                    <button
+                      className="primary"
+                      disabled={busy || sync}
+                      onClick={() => action('/sync')}
+                    >
+                      <RefreshCw size={16} className={sync ? 'spin' : ''} />
+                      {sync ? 'Syncing…' : 'Sync all'}{' '}
+                    </button>
+                  </div>
+                )}
               </div>
-              {page !== 'Settings' && (
-                <div className="page-actions">
-                  {page === 'Todo' && (
-                    <>
-                      <button className="inbox-toggle" onClick={() => setInboxVisible(true)}>
-                        <Mail size={16} />
-                        Inbox
-                      </button>
-                      <button
-                        className="primary"
-                        disabled={!data}
-                        onClick={() => setTaskDialog({})}
-                      >
-                        <Plus size={16} />
-                        Add task
-                      </button>
-                    </>
-                  )}
-                  <button
-                    className="primary"
-                    disabled={busy || sync}
-                    onClick={() => action('/sync')}
-                  >
-                    <RefreshCw size={16} className={sync ? 'spin' : ''} />
-                    {sync ? 'Syncing…' : 'Sync all'}{' '}
-                  </button>
-                </div>
-              )}
-            </div>
-            {!data ? (
+            )}
+            {recoveryRequired ? (
+              <div className="settings-panel">
+                <RecoverySettings onRestored={() => window.location.reload()} />
+              </div>
+            ) : !data ? (
               <div className="empty">
                 <Loader2 className="spin" />
                 <h2>{offline ? 'Local service unavailable' : 'Loading…'}</h2>
@@ -380,10 +451,35 @@ function App() {
               </div>
             ) : (
               <>
+                {page === 'Chat' && (
+                  <Chat
+                    key={JSON.stringify(chatTarget)}
+                    courses={activeCourses}
+                    initialCourseId={chatTarget.courseId}
+                    initialTaskId={chatTarget.taskId}
+                    initialDocumentId={chatTarget.documentId}
+                  />
+                )}
+                {page === 'Changes' && (
+                  <Changes
+                    courses={activeCourses}
+                    revision={data.revision}
+                    timezone={data.settings.timezone}
+                    onOpenTask={(id) => setSelected(id)}
+                  />
+                )}
                 {page === 'Todo' && (
                   <>
                     {connection === 'disconnected' && (
                       <div className="warning">Offline · Showing cached assignments</div>
+                    )}
+                    {!!data.changes?.critical_unread_count && (
+                      <div className="warning sync-warning">
+                        <span>{data.changes.critical_unread_count} important task changes</span>
+                        <button onClick={() => setPage('Changes')}>
+                          Review changes <ChevronRight size={14} />
+                        </button>
+                      </div>
                     )}
                     {courseFilter !== 'all' && (
                       <div className="course-filter-bar">
@@ -453,6 +549,7 @@ function App() {
                       <div className="views" role="group" aria-label="Assignment views">
                         {[
                           ['active', 'To do'],
+                          ['done', 'Done'],
                           ['all', 'All tasks'],
                           ['hidden', 'Hidden'],
                           ['archive', 'Archive'],
@@ -526,20 +623,31 @@ function App() {
                                 </h3>
                                 {rows.map((t) => (
                                   <div
-                                    className={`task-row ${completed(t) ? 'done' : ''}`}
+                                    className={`task-row ${completed(t) ? 'done' : ''} ${sourceWarning(t) ? 'uncertain' : ''} ${completion?.task.id === t.id ? `completing ${completion.phase}` : ''}`}
                                     key={t.id}
+                                    aria-busy={completion?.task.id === t.id}
                                   >
                                     <button
-                                      className={`checkbox ${t.local.dismissed ? 'checked' : ''}`}
-                                      aria-label={`${t.local.dismissed ? 'Restore' : 'Dismiss locally'} ${t.title}`}
-                                      disabled={busy}
-                                      onClick={() => update(t, { dismissed: !t.local.dismissed })}
+                                      className={`checkbox ${completed(t) || completion?.task.id === t.id ? 'checked' : ''}`}
+                                      aria-label={`${t.local.dismissed || t.local.completion_override === 'done' ? 'Restore' : completed(t) ? 'Completed at source:' : 'Complete'} ${t.title}`}
+                                      aria-pressed={completed(t) || completion?.task.id === t.id}
+                                      disabled={
+                                        busy ||
+                                        (completed(t) &&
+                                          !t.local.dismissed &&
+                                          t.local.completion_override !== 'done')
+                                      }
+                                      onClick={() => void toggleComplete(t)}
                                     >
-                                      {t.local.dismissed && <Check size={13} />}
+                                      {(completed(t) || completion?.task.id === t.id) && (
+                                        <Check size={13} />
+                                      )}
                                     </button>
                                     <button className="task-main" onClick={() => setSelected(t.id)}>
                                       <span className="task-title">
-                                        {t.title}
+                                        <span className="task-title-copy">
+                                          <span className="task-title-text">{t.title}</span>
+                                        </span>
                                         {t.local.pinned && <Pin size={13} />}{' '}
                                         {t.local.priority > 0 && (
                                           <span className="priority">P{t.local.priority}</span>
@@ -561,10 +669,17 @@ function App() {
                                         {t.local.note && <FileText size={12} />}
                                         {t.email_id && <Mail size={12} aria-label="Linked email" />}
                                       </span>
+                                      {sourceWarning(t) && (
+                                        <span className="task-source-warning">
+                                          {sourceWarning(t)}
+                                        </span>
+                                      )}
                                     </button>
-                                    <span className={`status ${t.submission_status}`}>
-                                      {t.submission_status.replaceAll('_', ' ')}
-                                    </span>
+                                    {!sourceWarning(t) && (
+                                      <span className={`status ${t.submission_status}`}>
+                                        {t.submission_status.replaceAll('_', ' ')}
+                                      </span>
+                                    )}
                                     <div
                                       className={`due ${group === 'Overdue' && !completed(t) ? 'overdue' : ''}`}
                                     >
@@ -689,66 +804,74 @@ function App() {
                                 </span>
                               )}
                             </div>
-                            <span className={`course-icon ${c.provider}`}>
+                            <span
+                              className="course-icon"
+                              style={{
+                                color: courseColor(c),
+                                backgroundColor: `color-mix(in srgb, ${courseColor(c)} 16%, transparent)`,
+                              }}
+                            >
                               <BookOpen size={22} />
                             </span>
                             <small>
                               {(c.providers ?? [c.provider]).map((p) => names[p]).join(' · ')}
                             </small>
                             <h2>{c.name}</h2>
-                            {(c.section || c.teacher) && (
-                              <p>{[c.section, c.teacher].filter(Boolean).join(' · ')}</p>
-                            )}
+                            <p className="course-code" aria-hidden={!c.section && !c.teacher}>
+                              {[c.section, c.teacher].filter(Boolean).join(' · ')}
+                            </p>
                             <footer>
-                              {c.deleted ? (
-                                <button
-                                  disabled={busy}
-                                  onClick={() =>
-                                    action(
-                                      `/courses/${encodeURIComponent(c.workspace_id ?? c.id)}`,
-                                      'PATCH',
-                                      { deleted: false },
-                                    )
-                                  }
-                                >
-                                  Restore course
-                                </button>
-                              ) : (
-                                <>
-                                  <button
-                                    onClick={() => {
-                                      setBindingCourse(c);
-                                      setCourseDialog(true);
-                                    }}
-                                  >
-                                    Edit course
-                                    <Link2 size={13} />
-                                  </button>
+                              <div className="course-actions">
+                                {c.deleted ? (
                                   <button
                                     disabled={busy}
                                     onClick={() =>
                                       action(
                                         `/courses/${encodeURIComponent(c.workspace_id ?? c.id)}`,
                                         'PATCH',
-                                        { disabled: !c.disabled },
+                                        { deleted: false },
                                       )
                                     }
                                   >
-                                    {c.disabled ? 'Enable' : 'Disable'}
+                                    Restore course
                                   </button>
-                                  <button
-                                    disabled={busy}
-                                    onClick={() =>
-                                      action(
-                                        `/courses/${encodeURIComponent(c.workspace_id ?? c.id)}`,
-                                        'DELETE',
-                                      )
-                                    }
-                                  >
-                                    Delete
-                                  </button>
-                                </>
-                              )}
+                                ) : (
+                                  <>
+                                    <button
+                                      onClick={() => {
+                                        setBindingCourse(c);
+                                        setCourseDialog(true);
+                                      }}
+                                    >
+                                      Edit course
+                                      <Link2 size={13} />
+                                    </button>
+                                    <button
+                                      disabled={busy}
+                                      onClick={() =>
+                                        action(
+                                          `/courses/${encodeURIComponent(c.workspace_id ?? c.id)}`,
+                                          'PATCH',
+                                          { disabled: !c.disabled },
+                                        )
+                                      }
+                                    >
+                                      {c.disabled ? 'Enable' : 'Disable'}
+                                    </button>
+                                    <button
+                                      disabled={busy}
+                                      onClick={() =>
+                                        action(
+                                          `/courses/${encodeURIComponent(c.workspace_id ?? c.id)}`,
+                                          'DELETE',
+                                        )
+                                      }
+                                    >
+                                      Delete
+                                    </button>
+                                  </>
+                                )}
+                              </div>
                               <span>
                                 {
                                   data.tasks.filter(
@@ -875,8 +998,20 @@ function App() {
               <p className="warning">Due date not refreshed</p>
             )}
             <dl>
-              <dt>Due date</dt>
+              <dt>{task.local.due_override ? 'Local due date' : 'Due date'}</dt>
               <dd>{date(task.due_at, true)}</dd>
+              {task.local.due_override && (
+                <>
+                  <dt>Source due date</dt>
+                  <dd>{date(task.source_due_at ?? null, true)}</dd>
+                </>
+              )}
+              {task.local.completion_override && (
+                <>
+                  <dt>Local status</dt>
+                  <dd>{task.local.completion_override}</dd>
+                </>
+              )}
               {task.provider !== 'custom' && (
                 <>
                   <dt>Submission closes</dt>
@@ -884,7 +1019,7 @@ function App() {
                   <dt>Available from</dt>
                   <dd>{task.available_at ? date(task.available_at, true) : '—'}</dd>
                   <dt>Source status</dt>
-                  <dd>{task.submission_status}</dd>
+                  <dd>{sourceWarning(task) || task.submission_status.replaceAll('_', ' ')}</dd>
                   <dt>Grade</dt>
                   <dd>
                     {task.score ?? '—'} / {task.points_possible ?? '—'}
@@ -898,13 +1033,34 @@ function App() {
             {task.missing_count > 0 && (
               <p className="warning">Not found in the last {task.missing_count} syncs</p>
             )}
-            {task.description && <p className="description">{task.description}</p>}
-            {safeUrl(task.url) && (
-              <a className="primary" href={safeUrl(task.url)} target="_blank" rel="noreferrer">
-                Open assignment
-                <ArrowUpRight size={16} />
-              </a>
+            {task.raw_data?.unavailable_fields?.includes('description') && (
+              <p className="warning">Description could not be fully read.</p>
             )}
+            <button
+              onClick={() => {
+                setChatTarget({ courseId: task.course_id ?? undefined, taskId: task.id });
+                setSelected(null);
+                setPage('Chat');
+              }}
+            >
+              <MessageSquare size={16} /> Ask about task
+            </button>
+            <TaskRelations
+              key={task.id}
+              task={task}
+              onOpenTask={(id) => setSelected(id)}
+              onOpenMail={(id) => {
+                setEmailToOpen(id);
+                setSelected(null);
+                setPage('Todo');
+                setInboxVisible(true);
+              }}
+              onOpenDocument={(id) => {
+                setChatTarget({ courseId: task.course_id ?? undefined, documentId: id });
+                setSelected(null);
+                setPage('Chat');
+              }}
+            />
             <div className="local-controls">
               <div className="button-row">
                 <button
@@ -948,6 +1104,7 @@ function App() {
                 busy={busy}
                 save={(note) => update(task, { note })}
               />
+              <TaskHistory key={task.id + '-history'} task={task} reload={load} />
             </div>
           </aside>
         </div>
@@ -976,6 +1133,12 @@ function NoteEditor({
   save: (note: string) => void;
 }) {
   const [note, setNote] = useState(task.local.note);
+  const previous = useRef(task.local.note);
+  useEffect(() => {
+    const saved = previous.current;
+    setNote((draft) => (draft === saved ? task.local.note : draft));
+    previous.current = task.local.note;
+  }, [task.local.note]);
   return (
     <>
       <label>
@@ -1005,6 +1168,7 @@ function SettingsPage({
   const [zone, setZone] = useState(settings.timezone);
   return (
     <div className="settings-panel">
+      <AISettings />
       <section>
         <h2>Preferences</h2>
         <label className="setting-row">
@@ -1050,21 +1214,10 @@ function SettingsPage({
           </div>
         </div>
       </section>
+      <RecoverySettings onRestored={() => window.location.reload()} />
       <section>
-        <h2>Data</h2>
+        <h2>Diagnostics</h2>
         <div className="setting-row">
-          <div>
-            <b>Database backup</b>
-          </div>
-          <button disabled={busy} onClick={() => action('/backup')}>
-            <ArrowDownToLine size={16} />
-            Create backup
-          </button>
-        </div>
-        <div className="setting-row">
-          <div>
-            <b>Diagnostics</b>
-          </div>
           <a href="/api/debug" target="_blank" rel="noreferrer">
             Open diagnostics
             <ArrowUpRight size={15} />

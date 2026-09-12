@@ -32,7 +32,7 @@ def test_upgrade_removes_demo_only_and_cannot_reenable_it(tmp_path):
     assert upgraded.state("google_classroom")["authorized"]
     assert all(row["provider"] != "demo" for row in upgraded.history())
     with upgraded.connection() as con:
-        assert con.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert con.execute("PRAGMA user_version").fetchone()[0] == 7
         assert con.execute("PRAGMA foreign_key_check").fetchall() == []
         assert con.execute("SELECT COUNT(*) FROM task_local_states").fetchone()[0] == 1
     # Retrying startup does not alter the surviving records.

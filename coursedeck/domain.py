@@ -1,8 +1,17 @@
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Literal
 from urllib.parse import quote
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, Field, field_validator
+
+from .task_state import (
+    TASK_FIELDS,
+    FieldAvailability,
+    SourceState,
+    field_availability,
+    normalize_status,
+)
 
 
 def now() -> datetime:
@@ -54,6 +63,24 @@ class Task(BaseModel):
     source_updated_at: datetime | None = None
     raw_data: dict = Field(default_factory=dict)
 
+    @field_validator("raw_data")
+    @classmethod
+    def observations(cls, value):
+        unavailable = value.get("unavailable_fields", [])
+        if not isinstance(unavailable, list) or any(
+            not isinstance(field, str) for field in unavailable
+        ):
+            raise ValueError("Unavailable fields must be a list of field names")
+        declared = value.get("field_availability", {})
+        if not isinstance(declared, dict) or any(
+            field not in TASK_FIELDS
+            or not isinstance(state, str)
+            or state not in set(FieldAvailability)
+            for field, state in declared.items()
+        ):
+            raise ValueError("Invalid source field observation")
+        return value
+
     @field_validator("due_at", "available_at", "closes_at", "source_updated_at")
     @classmethod
     def aware(cls, value: datetime | None) -> datetime | None:
@@ -71,6 +98,15 @@ class Task(BaseModel):
     def course_id(self) -> str:
         return identity(self.provider, self.course_external_id)
 
+    @property
+    def source_state(self) -> SourceState:
+        if self.availability_of("submission_status") != FieldAvailability.KNOWN:
+            return SourceState.UNKNOWN
+        return normalize_status(self.submission_status)
+
+    def availability_of(self, field: str) -> FieldAvailability:
+        return field_availability(self.model_dump(), field)
+
 
 class LocalState(BaseModel):
     hidden: bool = False
@@ -78,6 +114,17 @@ class LocalState(BaseModel):
     pinned: bool = False
     note: str = Field(default="", max_length=10000)
     priority: int = Field(default=0, ge=0, le=3)
+    due_override: bool = False
+    due_at_override: AwareDatetime | None = None
+    completion_override: Literal["done", "open"] | None = None
+
+
+class TaskScope(BaseModel):
+    """A course task list exhausted without skipped rows or unread pages."""
+
+    course_external_id: str = Field(min_length=1, max_length=512)
+    # Empty means all task types. Nonempty prefixes isolate independently read lists.
+    external_id_prefix: str = Field(default="", max_length=512)
 
 
 class SyncResult(BaseModel):
@@ -88,6 +135,9 @@ class SyncResult(BaseModel):
     metadata: dict = Field(default_factory=dict)
     # True only after exhausting every page/course in a known full snapshot.
     complete: bool = False
+    # Field-level failures may leave the outcome partial while a list is complete.
+    # A failed course/page/parser must not declare its scope covered.
+    covered_task_scopes: list[TaskScope] = Field(default_factory=list)
 
 
 class Settings(BaseModel):

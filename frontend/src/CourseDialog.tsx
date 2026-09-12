@@ -2,6 +2,7 @@ import { useRef, useEffect, useState } from 'react';
 import { X } from 'lucide-react';
 import type { Course, Snapshot } from './types';
 import type { Action } from './SourceCard';
+import { courseColor } from './colors';
 
 export function CourseDialog({
   data,
@@ -23,9 +24,13 @@ export function CourseDialog({
   );
   const [provider, setProvider] = useState(binding?.provider ?? 'google_classroom');
   const [remote, setRemote] = useState('');
-  const [links, setLinks] = useState<string[]>(
-    binding?.source_course_ids ?? (binding && !binding.needs_binding ? [binding.id] : []),
-  );
+  const [color, setColor] = useState(binding?.color ?? '');
+  const [mergeTarget, setMergeTarget] = useState('');
+  const [links, setLinks] = useState<string[]>([
+    ...new Set(
+      binding?.source_course_ids ?? (binding && !binding.needs_binding ? [binding.id] : []),
+    ),
+  ]);
   useEffect(() => {
     dialog.current?.showModal();
   }, []);
@@ -42,6 +47,11 @@ export function CourseDialog({
           local.workspace_id !== binding?.workspace_id &&
           (local.source_course_ids ?? [local.id]).includes(c.id),
       ),
+  );
+  const mergeCandidates = data.courses.filter(
+    (course) =>
+      !course.deleted &&
+      (course.workspace_id ?? course.id) !== (binding?.workspace_id ?? binding?.id),
   );
   return (
     <dialog
@@ -70,12 +80,14 @@ export function CourseDialog({
                   name: binding.original_name ?? binding.name,
                   alias: alias.trim() || null,
                   source_course_ids,
+                  color: color || null,
                 },
               )
             : await action('/courses', 'POST', {
                 name: name.trim(),
                 provider,
                 source_course_ids,
+                color: color || null,
               });
           if (saved) close();
         }}
@@ -111,6 +123,20 @@ export function CourseDialog({
               onChange={(e) => setName(e.target.value)}
             />
           </label>
+        )}
+        <label>
+          Color
+          <input
+            type="color"
+            aria-label="Course color"
+            value={color || courseColor(binding ?? undefined)}
+            onChange={(event) => setColor(event.target.value)}
+          />
+        </label>
+        {color && (
+          <button type="button" className="add-course-link" onClick={() => setColor('')}>
+            Use default color
+          </button>
         )}
         <label>
           Source
@@ -190,6 +216,48 @@ export function CourseDialog({
           </button>
         </div>
       </form>
+      {binding && !!mergeCandidates.length && !binding.deleted && (
+        <details>
+          <summary>Merge course</summary>
+          <form
+            onSubmit={async (event) => {
+              event.preventDefault();
+              if (!mergeTarget) return;
+              const saved = await action(
+                `/courses/${encodeURIComponent(mergeTarget)}/merge`,
+                'POST',
+                { course_ids: [binding.workspace_id ?? binding.id] },
+              );
+              if (saved) close();
+            }}
+          >
+            <label>
+              Into
+              <select
+                aria-label="Merge into course"
+                value={mergeTarget}
+                onChange={(event) => setMergeTarget(event.target.value)}
+              >
+                <option value="">Choose a course</option>
+                {mergeCandidates.map((course) => (
+                  <option key={course.id} value={course.workspace_id ?? course.id}>
+                    {course.name}
+                    {course.disabled ? ' (disabled)' : ''}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {mergeTarget && (
+              <p className="course-original">The destination keeps its name and color.</p>
+            )}
+            <div className="dialog-actions">
+              <button className="primary" disabled={busy || !mergeTarget}>
+                Merge courses
+              </button>
+            </div>
+          </form>
+        </details>
+      )}
     </dialog>
   );
 }

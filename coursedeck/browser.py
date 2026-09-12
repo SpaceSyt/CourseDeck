@@ -38,7 +38,7 @@ class BrowserManager:
     def exists(self):
         return self.path.is_dir()
 
-    async def launch(self, headless: bool, timezone: str | None = None):
+    async def launch(self, headless: bool, timezone: str | None = None, *, read_only: bool = False):
         if self.playwright is None:
             self.playwright = await async_playwright().start()
         self.path.mkdir(parents=True, exist_ok=True)
@@ -48,6 +48,7 @@ class BrowserManager:
             channel=self.channel,
             timezone_id=timezone,
             accept_downloads=False,
+            service_workers="block" if read_only else "allow",
             viewport={"width": 1280, "height": 900},
             args=["--disable-background-networking"],
         )
@@ -79,10 +80,10 @@ class BrowserManager:
             await context.close()
 
     @asynccontextmanager
-    async def session(self, timezone: str | None = None):
+    async def session(self, timezone: str | None = None, *, read_only: bool = False):
         if self.interactive is not None:
             raise ValueError("Finish interactive login before background sync")
-        context = await self.launch(True, timezone)
+        context = await self.launch(True, timezone, read_only=read_only)
         try:
             yield context
         finally:

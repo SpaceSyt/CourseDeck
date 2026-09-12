@@ -3,6 +3,14 @@
 Dependency packages are installed separately and carry their respective licenses. No whole
 third-party application has been forked or bundled.
 
+[pypdf](https://github.com/py-pdf/pypdf) is used for local PDF text extraction and is
+distributed under BSD-3-Clause (verified against the installed 6.18.0 package metadata).
+Its license is included with the separately installed package.
+
+[react-markdown](https://github.com/remarkjs/react-markdown) and
+[remark-gfm](https://github.com/remarkjs/remark-gfm) render chat Markdown and GFM tables.
+Both use the MIT license, included in their installed packages.
+
 The Gradescope parser was developed with reference to student-page endpoint and markup
 observations in [nyuoss/gradescope-api](https://github.com/nyuoss/gradescope-api) at commit
 `586ad513b6b4715682f09fc6fe3fff2e73304f74`. Its actual `LICENSE.md` at that commit was read.

@@ -1,11 +1,13 @@
 import json
+import re
 import sqlite3
-from contextlib import contextmanager
-from datetime import timedelta
+from contextlib import closing, contextmanager
 from pathlib import Path
 from uuid import uuid4
 
 from .domain import LocalState, Outcome, Settings, SyncResult, now
+from .migrations import initialize_component, migrate, validate_existing
+from .task_state import project_task_state, unread_fields
 
 
 class Database:
@@ -13,62 +15,13 @@ class Database:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as db:
+            validate_existing(db, "tasks", allow_historical=True)
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version > 6:
+            if version > 7:
                 raise RuntimeError("Database belongs to a newer CourseDeck version")
-            db.executescript("""
-                PRAGMA journal_mode=WAL;
-                CREATE TABLE IF NOT EXISTS courses (
-                    id TEXT PRIMARY KEY, provider TEXT NOT NULL,
-                    external_id TEXT NOT NULL, payload TEXT NOT NULL,
-                    UNIQUE(provider, external_id)
-                );
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id TEXT PRIMARY KEY, provider TEXT NOT NULL,
-                    course_id TEXT NOT NULL REFERENCES courses(id),
-                    external_id TEXT NOT NULL, payload TEXT NOT NULL,
-                    first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
-                    missing_count INTEGER NOT NULL DEFAULT 0,
-                    archived INTEGER NOT NULL DEFAULT 0,
-                    UNIQUE(provider, course_id, external_id)
-                );
-                CREATE TABLE IF NOT EXISTS task_local_states (
-                    task_id TEXT PRIMARY KEY REFERENCES tasks(id), payload TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS connector_states (
-                    provider TEXT PRIMARY KEY, payload TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS sync_history (
-                    id INTEGER PRIMARY KEY, provider TEXT NOT NULL,
-                    attempted_at TEXT NOT NULL, finished_at TEXT NOT NULL,
-                    outcome TEXT NOT NULL, task_count INTEGER NOT NULL,
-                    warnings TEXT NOT NULL, metadata TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS workspace_courses (
-                    id TEXT PRIMARY KEY, name TEXT NOT NULL, provider TEXT NOT NULL,
-                    remote_course_id TEXT UNIQUE REFERENCES courses(id)
-                );
-                CREATE TABLE IF NOT EXISTS mail_messages (
-                    id TEXT PRIMARY KEY, payload TEXT NOT NULL,
-                    received_at TEXT NOT NULL, local_payload TEXT NOT NULL DEFAULT '{}'
-                );
-                CREATE TABLE IF NOT EXISTS mail_rules (
-                    id TEXT PRIMARY KEY, payload TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS custom_tasks (
-                    id TEXT PRIMARY KEY, payload TEXT NOT NULL,
-                    email_id TEXT REFERENCES mail_messages(id),
-                    local_payload TEXT NOT NULL, created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS course_links (
-                    workspace_id TEXT NOT NULL REFERENCES workspace_courses(id) ON DELETE CASCADE,
-                    remote_course_id TEXT PRIMARY KEY REFERENCES courses(id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS course_preferences (
-                    course_id TEXT PRIMARY KEY, payload TEXT NOT NULL
-                );
-            """)
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("BEGIN IMMEDIATE")
+            initialize_component(db, "tasks_core")
             if version < 3:
                 # Retire the old demo source, including its independent local
                 # edits and aliases. Other providers are never touched.
@@ -103,6 +56,17 @@ class Database:
                         (entry["id"], json.dumps({"alias": alias})),
                     )
                 db.execute("PRAGMA user_version=6")
+            if version < 7:
+                # Missing from a source is not completion. Keep every cached task visible.
+                db.execute("UPDATE tasks SET archived=0")
+                for entry in db.execute("""SELECT provider, finished_at FROM sync_history
+                    WHERE id IN (SELECT MAX(id) FROM sync_history GROUP BY provider)""").fetchall():
+                    self._record_finished_sync(db, entry["provider"], entry["finished_at"])
+                db.execute("PRAGMA user_version=7")
+            from .changes import initialize
+
+            initialize(db)
+            migrate(db, "tasks")
 
     @contextmanager
     def connection(self):
@@ -141,12 +105,25 @@ class Database:
                 (provider, json.dumps(state)),
             )
 
+    def _record_finished_sync(self, db, provider: str, finished_at: str):
+        row = db.execute(
+            "SELECT payload FROM connector_states WHERE provider=?", (provider,)
+        ).fetchone()
+        state = (json.loads(row[0]) if row else {}) | {"last_finished_sync": finished_at}
+        db.execute(
+            "INSERT OR REPLACE INTO connector_states VALUES (?, ?)",
+            (provider, json.dumps(state)),
+        )
+
     def apply(self, provider: str, result: SyncResult, attempted_at: str):
         stamp = now()
         seen = stamp.isoformat()
         valid = result.outcome in (Outcome.SUCCESS, Outcome.PARTIAL)
         if any(x.provider != provider for x in [*result.courses, *result.tasks]):
             raise ValueError("Connector crossed provider identity boundary")
+        course_ids = {course.external_id for course in result.courses}
+        if any(scope.course_external_id not in course_ids for scope in result.covered_task_scopes):
+            raise ValueError("Covered task scope belongs to an unread course")
         # Everything, including history, commits atomically. Failed syncs never touch tasks.
         with self.connection() as db:
             if valid:
@@ -158,7 +135,7 @@ class Database:
                     )
                 for task in result.tasks:
                     payload = task.model_dump(mode="json")
-                    unavailable = task.raw_data.get("unavailable_fields", [])
+                    unavailable = unread_fields(task.raw_data)
                     if unavailable:
                         previous = db.execute(
                             "SELECT payload FROM tasks WHERE id=?", (task.id,)
@@ -193,17 +170,30 @@ class Database:
                             seen,
                         ),
                     )
-                if result.outcome == Outcome.SUCCESS and result.complete:
-                    # Three FULL successful snapshots and at least seven days unseen.
-                    db.execute(
-                        """UPDATE tasks SET missing_count=missing_count+1
-                        WHERE provider=? AND last_seen_at != ?""",
+                full_snapshot = result.outcome == Outcome.SUCCESS and result.complete
+                if full_snapshot or result.covered_task_scopes:
+                    scopes = {}
+                    for scope in result.covered_task_scopes:
+                        scopes.setdefault(scope.course_external_id, []).append(
+                            scope.external_id_prefix
+                        )
+                    unseen = db.execute(
+                        """SELECT t.id, t.external_id, c.external_id AS course_external_id
+                        FROM tasks t JOIN courses c ON c.id=t.course_id
+                        WHERE t.provider=? AND t.last_seen_at != ?""",
                         (provider, seen),
-                    )
-                    db.execute(
-                        """UPDATE tasks SET archived=1 WHERE provider=?
-                        AND missing_count>=3 AND last_seen_at<?""",
-                        (provider, (stamp - timedelta(days=7)).isoformat()),
+                    ).fetchall()
+                    missing_ids = [
+                        (row["id"],)
+                        for row in unseen
+                        if full_snapshot
+                        or any(
+                            row["external_id"].startswith(prefix)
+                            for prefix in scopes.get(row["course_external_id"], [])
+                        )
+                    ]
+                    db.executemany(
+                        "UPDATE tasks SET missing_count=missing_count+1 WHERE id=?", missing_ids
                     )
             db.execute(
                 """INSERT INTO sync_history
@@ -223,6 +213,11 @@ class Database:
                 "DELETE FROM sync_history WHERE id NOT IN "
                 "(SELECT id FROM sync_history ORDER BY id DESC LIMIT 1000)"
             )
+            # Retained independently of history pruning, atomically with the snapshot.
+            self._record_finished_sync(db, provider, seen)
+            from .changes import record_sync
+
+            record_sync(db, provider, seen, result.outcome)
 
     def courses(self):
         with self.connection() as db:
@@ -276,6 +271,10 @@ class Database:
                 name=alias or original,
                 disabled=local.get("disabled", False),
                 deleted=local.get("deleted", False),
+                color=local.get("color"),
+            )
+            course["source_names"] = list(
+                dict.fromkeys([*course["source_names"], *local.get("merged_names", [])])
             )
         return sorted(result.values(), key=lambda c: c["name"].casefold())
 
@@ -289,6 +288,33 @@ class Database:
         with self.connection() as db:
             self._patch_course_preferences(db, key, patch)
 
+    def resolve_course_alias(self, course_id: str | None) -> str | None:
+        if course_id is None:
+            return None
+        courses = self.courses()
+        # Existing source membership wins if a previously merged source was later detached.
+        for course in courses:
+            if course_id in (
+                course["id"],
+                course.get("workspace_id"),
+                *course["source_course_ids"],
+            ):
+                return course["id"]
+        with self.connection() as db:
+            preferences = {
+                row["course_id"]: json.loads(row["payload"])
+                for row in db.execute("SELECT course_id, payload FROM course_preferences")
+            }
+        for course in courses:
+            saved = preferences.get(course.get("workspace_id") or course["id"], {})
+            pending = list(saved.get("merged_courses", []))
+            while pending:
+                previous = pending.pop()
+                if course_id in (previous.get("id"), *previous.get("source_course_ids", [])):
+                    return course["id"]
+                pending.extend(previous.get("preferences", {}).get("merged_courses", []))
+        return None
+
     def _patch_course_preferences(self, db, key, patch):
         row = db.execute(
             "SELECT payload FROM course_preferences WHERE course_id=?", (key,)
@@ -296,14 +322,31 @@ class Database:
         value = (json.loads(row[0]) if row else {}) | patch
         if "alias" in value:
             value["alias"] = (value["alias"] or "").strip() or None
+        if "color" in patch:
+            color = patch["color"]
+            if color is not None and (
+                not isinstance(color, str) or re.fullmatch(r"#[0-9a-fA-F]{6}", color) is None
+            ):
+                raise ValueError("Color must be a six-digit hex color or null")
+            value["color"] = color.lower() if color is not None else None
         db.execute(
             "INSERT OR REPLACE INTO course_preferences VALUES (?, ?)", (key, json.dumps(value))
         )
 
     def source_courses(self):
+        owners = {
+            source_id: course
+            for course in self.courses()
+            for source_id in course["source_course_ids"]
+        }
         with self.connection() as db:
             return [
-                json.loads(row["payload"]) | {"id": row["id"]}
+                json.loads(row["payload"])
+                | {
+                    "id": row["id"],
+                    "workspace_id": owners.get(row["id"], {}).get("workspace_id"),
+                    "color": owners.get(row["id"], {}).get("color"),
+                }
                 for row in db.execute("SELECT * FROM courses ORDER BY id")
             ]
 
@@ -325,6 +368,7 @@ class Database:
         provider: str,
         remote_course_id: str | None,
         source_course_ids: list[str] | None = None,
+        color=None,
     ):
         key = "local:" + uuid4().hex
         with self.connection() as db:
@@ -347,6 +391,7 @@ class Database:
             )
             db.executemany("INSERT INTO course_links VALUES (?, ?)", [(key, item) for item in ids])
             self._save_course_alias(db, key, name, primary)
+            self._patch_course_preferences(db, key, {"color": color})
         return key
 
     def _save_course_alias(self, db, key, name, primary):
@@ -365,7 +410,7 @@ class Database:
                 raise ValueError("This source course is already linked to another course")
 
     def update_course_sources(
-        self, course_id: str, name: str, source_course_ids: list[str], alias=...
+        self, course_id: str, name: str, source_course_ids: list[str], alias=..., color=...
     ):
         ids = list(dict.fromkeys(source_course_ids))
         with self.connection() as db:
@@ -417,8 +462,159 @@ class Database:
                 self._patch_course_preferences(db, key, {"alias": alias})
             else:
                 self._save_course_alias(db, key, name, primary)
+            if color is not ...:
+                self._patch_course_preferences(db, key, {"color": color})
             db.execute("DELETE FROM course_links WHERE workspace_id=?", (key,))
             db.executemany("INSERT INTO course_links VALUES (?, ?)", [(key, item) for item in ids])
+        return key
+
+    def _merge_course_record(self, db, course_id):
+        row = db.execute(
+            "SELECT * FROM workspace_courses WHERE id=? OR remote_course_id=?",
+            (course_id, course_id),
+        ).fetchone()
+        if row:
+            record = dict(row)
+            record["source_course_ids"] = [
+                item[0]
+                for item in db.execute(
+                    "SELECT remote_course_id FROM course_links WHERE workspace_id=? ORDER BY rowid",
+                    (row["id"],),
+                )
+            ]
+            record["workspace_id"] = row["id"]
+        else:
+            row = db.execute("SELECT * FROM courses WHERE id=?", (course_id,)).fetchone()
+            if row is None:
+                raise KeyError(course_id)
+            if db.execute(
+                "SELECT 1 FROM course_links WHERE remote_course_id=?", (course_id,)
+            ).fetchone():
+                raise ValueError("Select the linked course to merge all of its sources")
+            record = {
+                "id": course_id,
+                "name": json.loads(row["payload"])["name"],
+                "provider": row["provider"],
+                "remote_course_id": course_id,
+                "source_course_ids": [course_id],
+                "workspace_id": None,
+            }
+        preferences = db.execute(
+            "SELECT payload FROM course_preferences WHERE course_id=?", (record["id"],)
+        ).fetchone()
+        record["preferences"] = json.loads(preferences[0]) if preferences else {}
+        return record
+
+    def merge_courses(self, target_id: str, course_ids: list[str]):
+        if not course_ids:
+            raise ValueError("Select a course to merge")
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            target = self._merge_course_record(db, target_id)
+            sources = {}
+            for course_id in course_ids:
+                source = self._merge_course_record(db, course_id)
+                if source["id"] == target["id"]:
+                    raise ValueError("Choose a different destination course")
+                sources[source["id"]] = source
+            if target["preferences"].get("deleted") or any(
+                source["preferences"].get("deleted") for source in sources.values()
+            ):
+                raise ValueError("Restore deleted courses before merging")
+            key = target["workspace_id"] or "local:" + uuid4().hex
+            if not target["workspace_id"]:
+                db.execute(
+                    "INSERT INTO workspace_courses VALUES (?, ?, ?, ?)",
+                    (key, target["name"], target["provider"], target["remote_course_id"]),
+                )
+                db.execute(
+                    "UPDATE course_preferences SET course_id=? WHERE course_id=?",
+                    (key, target["id"]),
+                )
+            members = list(
+                dict.fromkeys(
+                    [
+                        *target["source_course_ids"],
+                        *(
+                            member
+                            for source in sources.values()
+                            for member in source["source_course_ids"]
+                        ),
+                    ]
+                )
+            )
+            references = {target["id"], *members, *sources}
+            merged = list(target["preferences"].get("merged_courses", []))
+            merged_names = list(target["preferences"].get("merged_names", []))
+            for source in sources.values():
+                merged.append(
+                    {
+                        "id": source["id"],
+                        "name": source["name"],
+                        "source_course_ids": source["source_course_ids"],
+                        "preferences": source["preferences"],
+                    }
+                )
+                merged_names.extend(
+                    [
+                        source["preferences"].get("alias") or source["name"],
+                        *source["preferences"].get("merged_names", []),
+                    ]
+                )
+                if source["workspace_id"]:
+                    db.execute(
+                        "UPDATE course_links SET workspace_id=? WHERE workspace_id=?",
+                        (key, source["workspace_id"]),
+                    )
+                    db.execute(
+                        "DELETE FROM workspace_courses WHERE id=?", (source["workspace_id"],)
+                    )
+                    db.execute("DELETE FROM course_preferences WHERE course_id=?", (source["id"],))
+            primary = target["remote_course_id"] or (members[0] if members else None)
+            provider = (
+                db.execute("SELECT provider FROM courses WHERE id=?", (primary,)).fetchone()[0]
+                if primary
+                else target["provider"]
+            )
+            db.execute(
+                "UPDATE workspace_courses SET provider=?, remote_course_id=? WHERE id=?",
+                (provider, primary, key),
+            )
+            db.executemany(
+                "INSERT OR IGNORE INTO course_links VALUES (?, ?)",
+                [(key, member) for member in members],
+            )
+            self._patch_course_preferences(
+                db,
+                key,
+                {
+                    "merged_courses": merged,
+                    "merged_names": list(dict.fromkeys(merged_names)),
+                },
+            )
+            if (
+                not target["source_course_ids"]
+                and primary
+                and not target["preferences"].get("alias")
+            ):
+                self._save_course_alias(db, key, target["name"], primary)
+            for table, column in [("custom_tasks", "payload"), ("mail_messages", "local_payload")]:
+                for row in db.execute(f"SELECT id, {column} FROM {table}").fetchall():
+                    payload = json.loads(row[column])
+                    if payload.get("course_id") in references:
+                        payload["course_id"] = key
+                        db.execute(
+                            f"UPDATE {table} SET {column}=? WHERE id=?",
+                            (json.dumps(payload), row["id"]),
+                        )
+            for row in db.execute("SELECT id, payload FROM mail_rules").fetchall():
+                payload = json.loads(row["payload"])
+                if payload.get("action") == "course" and payload.get("value") in references:
+                    payload["value"] = key
+                    db.execute(
+                        "UPDATE mail_rules SET payload=? WHERE id=?",
+                        (json.dumps(payload), row["id"]),
+                    )
         return key
 
     def bind_course(self, workspace_id: str, remote_course_id: str):
@@ -442,8 +638,16 @@ class Database:
 
     def tasks(self):
         with self.connection() as db:
-            rows = db.execute("""SELECT t.*, l.payload AS local_payload FROM tasks t
-                LEFT JOIN task_local_states l ON l.task_id=t.id ORDER BY t.id""").fetchall()
+            rows = db.execute(
+                """SELECT t.*, l.payload AS local_payload FROM tasks t
+                LEFT JOIN task_local_states l ON l.task_id=t.id
+                ORDER BY t.id"""
+            ).fetchall()
+            checked_at = {
+                row["provider"]: json.loads(row["payload"]).get("last_finished_sync")
+                for row in db.execute("SELECT provider, payload FROM connector_states")
+                if "last_finished_sync" in json.loads(row["payload"])
+            }
         from .mail import custom_tasks
 
         course_map = {
@@ -452,8 +656,8 @@ class Database:
             for remote in course["source_course_ids"]
         }
 
-        return [
-            json.loads(r["payload"])
+        tasks = [
+            (payload := json.loads(r["payload"]))
             | {
                 "id": r["id"],
                 "course_id": course_map.get(r["course_id"], r["course_id"]),
@@ -462,38 +666,36 @@ class Database:
                 "last_seen_at": r["last_seen_at"],
                 "archived": bool(r["archived"]),
                 "missing_count": r["missing_count"],
+                "source_availability": "missing"
+                if r["missing_count"]
+                else (
+                    "present"
+                    if r["last_seen_at"] == checked_at.get(r["provider"], r["last_seen_at"])
+                    else "unconfirmed"
+                ),
+                "source_status_known": bool(payload.get("submission_status"))
+                and payload["submission_status"] != "unknown"
+                and r["last_seen_at"] == checked_at.get(r["provider"], r["last_seen_at"])
+                and "submission_status"
+                not in payload.get("raw_data", {}).get("unavailable_fields", []),
                 "local": json.loads(r["local_payload"])
                 if r["local_payload"]
                 else LocalState().model_dump(),
             }
             for r in rows
         ] + custom_tasks(self)
+        for task in tasks:
+            task["source_due_at"] = task.get("due_at")
+            task.update(project_task_state(task))
+            if task["local"].get("due_override"):
+                task["due_at"] = task["local"].get("due_at_override")
+        return tasks
 
     def patch_local(self, task_id: str, patch: dict):
-        with self.connection() as db:
-            if task_id.startswith("custom:"):
-                row = db.execute(
-                    "SELECT local_payload FROM custom_tasks WHERE id=?", (task_id,)
-                ).fetchone()
-                if not row:
-                    raise KeyError(task_id)
-                value = LocalState.model_validate(json.loads(row[0]) | patch)
-                db.execute(
-                    "UPDATE custom_tasks SET local_payload=? WHERE id=?",
-                    (value.model_dump_json(), task_id),
-                )
-                return value
-            if not db.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone():
-                raise KeyError(task_id)
-            row = db.execute(
-                "SELECT payload FROM task_local_states WHERE task_id=?", (task_id,)
-            ).fetchone()
-            value = LocalState.model_validate((json.loads(row[0]) if row else {}) | patch)
-            db.execute(
-                "INSERT OR REPLACE INTO task_local_states VALUES (?, ?)",
-                (task_id, value.model_dump_json()),
-            )
-        return value
+        from .task_edits import TaskEdits
+
+        result = TaskEdits(self).patch_local(task_id, patch)
+        return LocalState.model_validate(result["after"])
 
     def history(self, limit=100):
         with self.connection() as db:
@@ -506,5 +708,5 @@ class Database:
             ]
 
     def backup(self, destination: Path):
-        with self.connection() as source, sqlite3.connect(destination) as target:
+        with self.connection() as source, closing(sqlite3.connect(destination)) as target:
             source.backup(target)

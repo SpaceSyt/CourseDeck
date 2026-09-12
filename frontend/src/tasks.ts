@@ -1,7 +1,31 @@
 import type { Task } from './types';
+import taskContract from './task-contract.json';
 
 export const completed = (task: Task) =>
-  task.local.dismissed || ['submitted', 'graded', 'returned'].includes(task.submission_status);
+  task.local.completion_override
+    ? task.local.completion_override === 'done'
+    : task.local.dismissed ||
+      (!sourceWarning(task) &&
+        (task.source_state !== undefined
+          ? task.source_state === 'done'
+          : taskContract.done_statuses.includes(task.submission_status)));
+export function sourceWarning(task: Task) {
+  if (task.provider === 'custom') return '';
+  if (
+    task.source_availability === 'missing' ||
+    (!task.source_availability && task.missing_count > 0)
+  )
+    return 'Not found in source';
+  if (task.source_availability === 'unconfirmed') return 'Not refreshed';
+  if (
+    task.source_status_known === false ||
+    !task.submission_status ||
+    task.submission_status === 'unknown' ||
+    task.raw_data?.unavailable_fields?.includes('submission_status')
+  )
+    return 'Status unknown';
+  return '';
+}
 export function dayKey(date: Date, zone: string) {
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: zone,

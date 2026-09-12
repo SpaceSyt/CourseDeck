@@ -1,20 +1,45 @@
 import asyncio
+import hashlib
+import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .associations import AssociationStore
+from .associations import build_router as build_associations_router
+from .changes import build_changes_router
+from .changes import summary as changes_summary
+from .chat import build_chat_router
 from .connectors.registry import build_connectors
 from .db import Database
 from .domain import Settings, now
 from .gmail_browser import GmailBrowser
-from .mail import CustomTaskInput, MailPatch, MailRule, MailStore, save_custom_task
+from .knowledge import KnowledgeStore
+from .library import material_sync
+from .mail import (
+    CustomTaskInput,
+    MailPatch,
+    MailRule,
+    MailStore,
+    build_mail_rules_router,
+    save_custom_task,
+)
+from .maintenance import MaintenanceGate
+from .materials import MaterialCollector
+from .recovery import RecoveryManager, build_recovery_router
+from .revisions import DatabaseRevision
 from .sync import SyncEngine
+from .task_edits import TaskEdits
+from .task_history import build_task_history_router
 
 
 class LocalPatch(BaseModel):
@@ -24,6 +49,7 @@ class LocalPatch(BaseModel):
     pinned: bool | None = None
     note: str | None = Field(default=None, max_length=10000)
     priority: int | None = Field(default=None, ge=0, le=3)
+    expected_version: str | None = Field(default=None, min_length=64, max_length=64)
 
 
 class CourseCreate(BaseModel):
@@ -32,6 +58,7 @@ class CourseCreate(BaseModel):
     provider: str
     remote_course_id: str | None = None
     source_course_ids: list[str] | None = Field(default=None, max_length=100)
+    color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
 
 
 class CourseSources(BaseModel):
@@ -39,6 +66,7 @@ class CourseSources(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     source_course_ids: list[str] = Field(max_length=100)
     alias: str | None = Field(default=None, max_length=200)
+    color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
 
 
 class CoursePatch(BaseModel):
@@ -46,6 +74,12 @@ class CoursePatch(BaseModel):
     alias: str | None = Field(default=None, max_length=200)
     disabled: bool = False
     deleted: bool = False
+    color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+
+
+class CourseMerge(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    course_ids: list[str] = Field(min_length=1, max_length=100)
 
 
 class CourseBinding(BaseModel):
@@ -57,25 +91,101 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     data_dir = data_dir or Path(os.environ.get("COURSEDECK_DATA_DIR", "data")).resolve()
     db = Database(data_dir / "coursedeck.sqlite3")
     engine = SyncEngine(db, build_connectors(db, data_dir))
+    knowledge = KnowledgeStore(data_dir / "knowledge.sqlite3")
+    if not (data_dir / "backups" / "restore-pending.json").exists():
+        knowledge.index_tasks(db)
+    materials = MaterialCollector(db, engine, data_dir, knowledge_store=knowledge)
+    engine.after_sync = material_sync(db, materials, knowledge)
     mail = MailStore(db)
     gmail = GmailBrowser(db, data_dir)
+    associations = AssociationStore(db, knowledge, mail)
+    recovery = RecoveryManager(data_dir, db, knowledge)
+    snapshot_revision = DatabaseRevision(db.path)
+    snapshot_session = uuid4().hex
+
+    def close_readers():
+        associations.close()
+        knowledge.close()
+        snapshot_revision.close()
+
+    gate = MaintenanceGate(lambda: recovery.journal.exists())
+    background = {"started": False, "mail_poll": None, "source_poll": None}
+
+    def start_background():
+        if background["started"] and not recovery.journal.exists():
+            if background["mail_poll"] is None or background["mail_poll"].done():
+                background["mail_poll"] = asyncio.create_task(gmail.poll())
+            if background["source_poll"] is None or background["source_poll"].done():
+                background["source_poll"] = engine.spawn(engine.poll())
+
+    async def stop_mail():
+        poll = background["mail_poll"]
+        if poll is not None:
+            poll.cancel()
+            await asyncio.gather(poll, return_exceptions=True)
+            background["mail_poll"] = None
+        await gmail.close()
+
+    @asynccontextmanager
+    async def maintenance():
+        async with gate.maintenance():
+            browsers = [gmail.browser] + [
+                getattr(getattr(source, "active", source), "browser", None)
+                for source in engine.connectors.values()
+            ]
+            if any(browser and browser.interactive for browser in browsers):
+                raise HTTPException(409, "Finish source sign-in before backing up or restoring")
+            try:
+                await stop_mail()
+                async with (
+                    gmail.lock,
+                    engine.maintenance(can_resume=lambda: not recovery.journal.exists()),
+                ):
+                    close_readers()
+                    yield
+                    materials.reset_runtime_cache()
+                    if not recovery.journal.exists():
+                        knowledge.index_tasks(db)
+                    engine.revision += 1
+            finally:
+                start_background()
 
     @asynccontextmanager
     async def lifespan(app):
-        mail_poll = asyncio.create_task(gmail.poll())
-        if db.settings().startup_sync:
-            engine.spawn(engine.sync_all())
+        background["started"] = True
+        start_background()
+        if db.settings().startup_sync and not recovery.journal.exists():
+            engine.spawn(engine.sync_all(automatic=True))
             gmail.spawn()
         yield
-        mail_poll.cancel()
-        await asyncio.gather(mail_poll, return_exceptions=True)
-        await gmail.close()
+        background["started"] = False
+        await stop_mail()
         await engine.close()
+        close_readers()
 
     app = FastAPI(title="CourseDeck", lifespan=lifespan)
     app.state.db, app.state.engine = db, engine
+    app.state.knowledge = knowledge
     app.state.gmail = gmail
+    app.state.associations = associations
+    app.state.recovery = recovery
+    app.state.maintenance_gate = gate
+    app.state.close_readers = close_readers
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
+    app.include_router(
+        build_chat_router(
+            db,
+            engine,
+            data_dir,
+            material_fetch=materials.fetch,
+            knowledge_store=knowledge,
+        )
+    )
+    app.include_router(build_changes_router(db))
+    app.include_router(build_task_history_router(db))
+    app.include_router(build_associations_router(associations))
+    app.include_router(build_mail_rules_router(db))
+    app.include_router(build_recovery_router(recovery, maintenance))
 
     @app.exception_handler(ValueError)
     async def invalid_config(request, exc):
@@ -103,7 +213,21 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 return JSONResponse(
                     {"detail": "Only the local CourseDeck UI may make changes"}, 403
                 )
-        response = await call_next(request)
+        protected = request.url.path.startswith("/api/") and not (
+            request.url.path in {"/api/heartbeat", "/api/backup"}
+            or request.url.path.startswith("/api/recovery/")
+        )
+        if protected:
+            async with gate.request() as admitted:
+                if not admitted:
+                    return JSONResponse(
+                        {"detail": "Database recovery is in progress or requires attention"},
+                        503,
+                        headers={"Cache-Control": "no-store", "Retry-After": "3"},
+                    )
+                response = await call_next(request)
+        else:
+            response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Content-Security-Policy"] = (
@@ -121,14 +245,28 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/heartbeat")
     async def heartbeat():
-        return {"service": "coursedeck", "status": "connected", "time": now().isoformat()}
+        return {
+            "service": "coursedeck",
+            "status": "connected",
+            "time": now().isoformat(),
+            "maintenance": gate.busy,
+            "recovery_required": recovery.journal.exists(),
+        }
+
+    @app.get("/api/recovery/status")
+    async def recovery_status():
+        return {"maintenance": gate.busy, "recovery_required": recovery.journal.exists()}
 
     @app.post("/api/courses", status_code=201)
     async def add_course(course: CourseCreate):
         connector(course.provider)
         try:
             key = db.add_course(
-                course.name, course.provider, course.remote_course_id, course.source_course_ids
+                course.name,
+                course.provider,
+                course.remote_course_id,
+                course.source_course_ids,
+                color=course.color,
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
@@ -138,6 +276,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     async def update_course_sources(course_id: str, value: CourseSources):
         try:
             options = {"alias": value.alias} if "alias" in value.model_fields_set else {}
+            if "color" in value.model_fields_set:
+                options["color"] = value.color
             return {
                 "id": db.update_course_sources(
                     course_id, value.name, value.source_course_ids, **options
@@ -155,6 +295,15 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(404, "Course not found") from exc
         return {"ok": True}
+
+    @app.post("/api/courses/{course_id}/merge")
+    async def merge_courses(course_id: str, value: CourseMerge):
+        try:
+            return {"id": db.merge_courses(course_id, value.course_ids)}
+        except KeyError as exc:
+            raise HTTPException(404, "Course not found") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.delete("/api/courses/{course_id}")
     async def delete_course(course_id: str):
@@ -175,39 +324,54 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         return {"message": "Source course linked."}
 
     @app.get("/api/snapshot")
-    async def snapshot():
-        return {
+    async def snapshot(request: Request):
+        before = snapshot_revision.token()
+        sources = [
+            {
+                "key": k,
+                "name": c.display_name,
+                "description": c.description,
+                "manual_login": c.manual_login,
+                "configuration_fields": c.configuration_fields,
+                "configuration_values": c.configuration_values,
+                "status": c.connection_status(),
+                "syncing": k in engine.running,
+                **{
+                    field: value
+                    for field, value in db.state(k).items()
+                    if field
+                    in {
+                        "last_outcome",
+                        "last_successful_sync",
+                        "last_attempted_sync",
+                        "warnings",
+                        "metadata",
+                    }
+                },
+            }
+            for k, c in engine.connectors.items()
+        ]
+        token = hashlib.sha256(
+            json.dumps(
+                [snapshot_session, before, engine.revision, sources], sort_keys=True
+            ).encode()
+        ).hexdigest()
+        etag = '"' + token + '"'
+        stable = before == snapshot_revision.token()
+        if stable and request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers={"ETag": etag})
+        value = {
             "tasks": db.tasks(),
             "courses": db.courses(),
             "source_courses": db.source_courses(),
             "revision": engine.revision,
+            "changes": changes_summary(db),
             "settings": db.settings(),
-            "sources": [
-                {
-                    "key": k,
-                    "name": c.display_name,
-                    "description": c.description,
-                    "manual_login": c.manual_login,
-                    "configuration_fields": c.configuration_fields,
-                    "configuration_values": c.configuration_values,
-                    "status": c.connection_status(),
-                    "syncing": k in engine.running,
-                    **{
-                        field: value
-                        for field, value in db.state(k).items()
-                        if field
-                        in {
-                            "last_outcome",
-                            "last_successful_sync",
-                            "last_attempted_sync",
-                            "warnings",
-                            "metadata",
-                        }
-                    },
-                }
-                for k, c in engine.connectors.items()
-            ],
+            "sources": sources,
         }
+        # A concurrent writer invalidates this observation; never certify a mixed snapshot.
+        headers = {"ETag": etag} if stable and before == snapshot_revision.token() else {}
+        return JSONResponse(jsonable_encoder(value), headers=headers)
 
     @app.post("/api/custom-tasks", status_code=201)
     async def create_custom_task(value: CustomTaskInput):
@@ -231,8 +395,12 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         ignored: bool = False,
         offset: int = Query(0, ge=0),
         limit: int = Query(50, ge=1, le=100),
+        attention_only: bool = False,
+        order: Literal["newest", "attention"] = "newest",
     ):
-        return mail.list(deleted, ignored, offset, limit) | {"connection": gmail.status()}
+        return mail.list(
+            deleted, ignored, offset, limit, attention_only=attention_only, order=order
+        ) | {"connection": gmail.status()}
 
     @app.get("/api/mail/rules")
     async def mail_rules():
@@ -251,6 +419,20 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             mail.delete_rule(key)
         except KeyError as exc:
             raise HTTPException(404, "Rule not found") from exc
+        return {"ok": True}
+
+    @app.put("/api/mail/rules/{key}")
+    async def update_mail_rule(key: str, rule: MailRule):
+        try:
+            return {"id": mail.update_rule(key, rule)}
+        except KeyError as exc:
+            raise HTTPException(404, "Rule not found") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/mail/rules/reset-defaults")
+    async def reset_mail_rules():
+        mail.reset_defaults()
         return {"ok": True}
 
     @app.post("/api/mail/connection/{operation}")
@@ -352,9 +534,16 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     @app.patch("/api/tasks/{task_id:path}/local")
     async def patch_local(task_id: str, patch: LocalPatch):
         try:
-            return db.patch_local(task_id, patch.model_dump(exclude_none=True))
+            result = TaskEdits(db).patch_local(
+                task_id,
+                patch.model_dump(exclude_none=True, exclude={"expected_version"}),
+                expected_version=patch.expected_version,
+            )
+            return result["after"]
         except KeyError as exc:
             raise HTTPException(404, "Task not found") from exc
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     @app.put("/api/settings")
     async def settings(value: Settings):
@@ -378,13 +567,9 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/backup")
     async def backup():
-        from .domain import now
-
-        folder = data_dir / "backups"
-        folder.mkdir(exist_ok=True)
-        path = folder / f"coursedeck-{now().strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
-        db.backup(path)
-        return {"message": f"Backup saved to {path}"}
+        async with maintenance():
+            manifest = recovery.create_backup()
+        return {"message": "Task and knowledge backup saved", "backup": manifest}
 
     frontend = Path(__file__).resolve().parent.parent / "frontend" / "dist"
     if frontend.exists():

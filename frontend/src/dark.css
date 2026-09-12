@@ -103,10 +103,6 @@ a:focus-visible {
   margin-top: auto;
   padding-top: 18px;
 }
-.tiny-status {
-  background: #455269;
-}
-.tiny-status.online,
 .connection-light {
   background: #72c89b;
 }
@@ -236,6 +232,14 @@ a:focus-visible {
 .done .task-title {
   color: var(--muted);
 }
+.task-row.uncertain {
+  border-style: dashed;
+  background: #1b2029;
+}
+.task-row.uncertain .task-title,
+.task-source-warning {
+  color: #b8c0cd;
+}
 .status {
   background: var(--surface);
   border-color: var(--line);
@@ -248,6 +252,8 @@ a:focus-visible {
 }
 .status.submitted,
 .status.graded,
+.status.completed,
+.status.returned,
 .status.connected {
   background: #20392f;
   border-color: #31503f;
@@ -590,6 +596,7 @@ a:focus-visible {
 /* Keep the overview cards, with the assignment list as the main reading area. */
 .content-todo {
   padding-top: 28px;
+  overflow-x: clip;
 }
 .content-todo .page-heading {
   margin-bottom: 24px;
@@ -637,6 +644,7 @@ a:focus-visible {
   border: 0;
   border-bottom: 1px solid var(--line);
   border-radius: 0;
+  flex-wrap: wrap;
 }
 .content-todo .views button {
   position: relative;

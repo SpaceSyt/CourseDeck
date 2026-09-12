@@ -1,0 +1,49 @@
+{
+  "done_statuses": [
+    "completed",
+    "graded",
+    "returned",
+    "submitted"
+  ],
+  "open_statuses": [
+    "assigned",
+    "in_progress",
+    "incomplete",
+    "missing",
+    "new",
+    "not_started",
+    "not_submitted",
+    "open",
+    "reopened",
+    "resubmission_required",
+    "returned_for_revision",
+    "started",
+    "unsubmitted"
+  ],
+  "fields": [
+    "due_at",
+    "available_at",
+    "closes_at",
+    "description",
+    "submission_status",
+    "score",
+    "graded",
+    "points_possible"
+  ],
+  "source_states": [
+    "open",
+    "done",
+    "unknown"
+  ],
+  "source_availability": [
+    "present",
+    "missing",
+    "unconfirmed"
+  ],
+  "field_availability": [
+    "known",
+    "empty",
+    "unread",
+    "unknown"
+  ]
+}

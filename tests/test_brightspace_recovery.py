@@ -6,8 +6,9 @@ import pytest
 from playwright.async_api import async_playwright
 
 from coursedeck.connectors.brightspace import BrightspaceAPITransport, BrightspaceConnector
+from coursedeck.connectors.http import TransportError
 from coursedeck.db import Database
-from coursedeck.domain import Outcome
+from coursedeck.domain import Course, Outcome, SyncResult
 
 
 def scheduled(key=10, **changes):
@@ -119,6 +120,7 @@ async def test_browser_restores_sso_before_api_on_each_restart(tmp_path):
             assert result.outcome == Outcome.PARTIAL
             assert len(result.courses) == 1 and len(result.tasks) == 1
             assert result.tasks[0].title == "Reading 10"
+        assert any("myItems" in path for path, _ in calls)
         assert all(authenticated for path, authenticated in calls if "/api/" in path)
         assert sum(path == "/d2l/home" and not auth for path, auth in calls) == 2
         await browser.close()
@@ -148,7 +150,20 @@ async def test_content_pagination_and_unknown_dates_retain_items(next_url):
             return {"Objects": [scheduled(11, DueDate="unrecognized date")], "Next": None}
         return {"Objects": [scheduled()], "Next": next_url}
 
-    result = await BrightspaceAPITransport(get, "https://school.example", "1.49", "1.82").sync()
+    transport = BrightspaceAPITransport(get, "https://school.example", "1.49", "1.82")
+    result = SyncResult(outcome=Outcome.PARTIAL, metadata={"content_items_checked": 0})
+    try:
+        await transport.scheduled_content(
+            Course(
+                provider="brightspace",
+                external_id="1",
+                name="Computing",
+                source_url="https://school.example/d2l/home/1",
+            ),
+            result,
+        )
+    except TransportError as exc:
+        result.warnings.append(exc.safe_message)
     assert result.outcome == Outcome.PARTIAL and not result.complete
     assert result.tasks[0].submission_status == "unknown"  # Reading content is not submission.
     assert result.tasks[0].available_at is not None  # Future availability does not drop a deadline.
@@ -158,5 +173,5 @@ async def test_content_pagination_and_unknown_dates_retain_items(next_url):
         assert any("left the source endpoint" in warning for warning in result.warnings)
     else:
         assert len(result.tasks) == 2 and result.tasks[1].due_at is None
-        assert result.tasks[1].raw_data["unavailable_fields"] == ["due_at"]
+        assert result.tasks[1].raw_data["unavailable_fields"] == ["due_at", "description"]
         assert any("a date could not be read" in warning for warning in result.warnings)

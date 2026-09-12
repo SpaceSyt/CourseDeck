@@ -46,6 +46,9 @@ export function Inbox({
   const [ignored, setIgnored] = useState(false);
   const [offset, setOffset] = useState(0);
   const [rules, setRules] = useState(false);
+  const [ruleEmail, setRuleEmail] = useState<MailMessage | null>(null);
+  const [attentionOnly, setAttentionOnly] = useState(false);
+  const [priorityFirst, setPriorityFirst] = useState(false);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -56,14 +59,14 @@ export function Inbox({
     const version = ++request.current;
     try {
       const page = await api<MailPage>(
-        `/mail?deleted=${deleted}&ignored=${ignored}&offset=${offset}`,
+        `/mail?deleted=${deleted}&ignored=${ignored}&offset=${offset}&attention_only=${attentionOnly}&order=${priorityFirst ? 'attention' : 'newest'}`,
       );
       if (version === request.current) setData(page);
     } catch {
       if (version === request.current)
         setError('Inbox unavailable. Retry when the local service reconnects.');
     }
-  }, [deleted, ignored, offset]);
+  }, [deleted, ignored, offset, attentionOnly, priorityFirst]);
   useEffect(() => {
     void load();
     const timer = setInterval(() => void load(), 10000);
@@ -174,9 +177,32 @@ export function Inbox({
               />
               Show auto-ignored
             </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={attentionOnly}
+                onChange={(e) => {
+                  setAttentionOnly(e.target.checked);
+                  setOffset(0);
+                }}
+              />
+              Priority only
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={priorityFirst}
+                onChange={(e) => {
+                  setPriorityFirst(e.target.checked);
+                  setOffset(0);
+                }}
+              />
+              Priority first
+            </label>
             <button
               onClick={() => {
                 setRules(true);
+                setRuleEmail(null);
                 menu.current?.removeAttribute('open');
               }}
             >
@@ -199,6 +225,32 @@ export function Inbox({
           </div>
         </details>
       </header>
+      {(attentionOnly || priorityFirst) && (
+        <div className="inbox-view-filters">
+          {attentionOnly && (
+            <button
+              aria-label="Clear priority filter"
+              onClick={() => {
+                setAttentionOnly(false);
+                setOffset(0);
+              }}
+            >
+              Priority only ×
+            </button>
+          )}
+          {priorityFirst && (
+            <button
+              aria-label="Sort emails by newest"
+              onClick={() => {
+                setPriorityFirst(false);
+                setOffset(0);
+              }}
+            >
+              Priority first ×
+            </button>
+          )}
+        </div>
+      )}
       {error && (
         <p className="inbox-error" role="alert">
           {error}
@@ -311,10 +363,20 @@ export function Inbox({
               )}
             </div>
           )}
-          <button className="primary" onClick={() => addTask(selected)}>
-            <Plus size={16} />
-            Add to do
-          </button>
+          <div className="mail-task-actions">
+            <button className="primary" onClick={() => addTask(selected)}>
+              <Plus size={16} />
+              Add to do
+            </button>
+            <button
+              onClick={() => {
+                setRuleEmail(selected);
+                setRules(true);
+              }}
+            >
+              Create rule
+            </button>
+          </div>
           {!selected.body_complete && <p className="inbox-error">Email content incomplete</p>}
           <div className="mail-body">
             {linkedText(selected.body || selected.snippet || 'No text content')}
@@ -346,6 +408,11 @@ export function Inbox({
                     <span className="mail-snippet">
                       {mail.classification === 'unclassifiable' && <em>Cannot classify · </em>}
                       {mail.deleted ? 'Deleted · ' : mail.ignored ? 'Ignored · ' : ''}
+                      {mail.attention && (
+                        <em className="mail-priority">
+                          {mail.attention_reasons?.[0] || 'Priority'} ·{' '}
+                        </em>
+                      )}
                       {mail.snippet}
                     </span>
                   </span>
@@ -376,9 +443,11 @@ export function Inbox({
             <p className="mail-empty">
               {connection?.syncing
                 ? 'Waiting for mail…'
-                : connection?.status === 'connected'
-                  ? 'No emails here'
-                  : 'No cached emails'}
+                : attentionOnly
+                  ? 'No priority emails'
+                  : connection?.status === 'connected'
+                    ? 'No emails here'
+                    : 'No cached emails'}
             </p>
           )}
           {data && (data.has_more || offset > 0) && (
@@ -407,6 +476,7 @@ export function Inbox({
       {rules && (
         <MailRules
           courses={courses}
+          email={ruleEmail}
           close={() => setRules(false)}
           changed={() => {
             void load();

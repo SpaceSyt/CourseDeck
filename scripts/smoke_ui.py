@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -34,7 +35,34 @@ async def check_ui(base_url):
         assert (
             await page.evaluate("getComputedStyle(document.documentElement).colorScheme") == "dark"
         )
+        await check_task_completion(page)
+        await check_source_status_views(page)
+        await page.locator("nav").get_by_role("button", name="Courses", exact=True).click()
+        cards = page.locator(".course-card")
+        await expect(cards).to_have_count(2)
+        codes = await cards.locator(".course-code").evaluate_all(
+            "els => els.map(el => ({text: el.textContent, "
+            "height: el.getBoundingClientRect().height}))"
+        )
+        assert codes[0]["text"] and not codes[1]["text"]
+        assert abs(codes[0]["height"] - codes[1]["height"]) < 1
+        footers = await cards.locator("footer").evaluate_all(
+            "els => els.map(el => el.getBoundingClientRect().top)"
+        )
+        assert abs(footers[0] - footers[1]) < 1
+        await page.screenshot(path="data/debug/course-alignment.png", full_page=True)
+        await page.locator("nav").get_by_role("button", name="Todo", exact=False).click()
         await page.locator(".task-main").click()
+        previous_note = await page.get_by_placeholder("Add a note…").input_value()
+        await page.get_by_placeholder("Add a note…").fill("Keep this note")
+        await page.get_by_role("button", name="Save note", exact=True).click()
+        await expect(page.get_by_role("button", name="Save note", exact=True)).to_be_disabled()
+        history = page.locator(".task-edit-history")
+        await history.locator("summary").click()
+        await expect(history).to_contain_text("note")
+        await history.get_by_role("button", name="Undo", exact=True).click()
+        await expect(page.get_by_placeholder("Add a note…")).to_have_value(previous_note)
+        await expect(history).to_contain_text("Undone")
         await page.get_by_placeholder("Add a note…").fill("Keep this note")
         await page.get_by_role("button", name="Save note", exact=True).click()
         await expect(page.get_by_role("button", name="Save note", exact=True)).to_be_disabled()
@@ -199,8 +227,16 @@ async def check_ui(base_url):
         rules = page.locator(".mail-rules")
         await rules.get_by_label("Contains", exact=True).fill("Campus newsletter")
         await rules.get_by_label("Apply", exact=True).select_option("ignore")
-        await rules.get_by_role("button", name="Add rule", exact=True).click()
-        await expect(rules.locator(".rule-list > div")).to_have_count(1)
+        await rules.get_by_role("button", name="Preview changes", exact=True).click()
+        impact = rules.get_by_role("region", name="Rule impact", exact=True)
+        await expect(impact).to_contain_text("1 newly ignored")
+        await expect(
+            rules.locator(".rule-list > div").filter(has_text="Campus newsletter")
+        ).to_have_count(0)
+        await impact.get_by_role("button", name="Apply changes", exact=True).click()
+        await expect(
+            rules.locator(".rule-list > div").filter(has_text="Campus newsletter")
+        ).to_have_count(1)
         await rules.get_by_role("button", name="Done", exact=True).click()
         await expect(page.locator(".mail-row")).to_have_count(2)
         await page.get_by_label("Inbox menu", exact=True).click()
@@ -234,11 +270,133 @@ async def check_ui(base_url):
         await browser.close()
 
 
+async def check_task_completion(page):
+    row = page.locator(".task-row")
+    await expect(row.locator(".task-source-warning")).to_have_text("Status unknown")
+    await expect(row).to_have_class(re.compile(r"\buncertain\b"))
+
+    async def fail_save(route):
+        await route.fulfill(status=500, json={"detail": "Test save failed"})
+
+    await page.route("**/api/tasks/*/local", fail_save)
+    await row.get_by_role("button", name="Complete Read chapter 2", exact=True).click()
+    await expect(page.locator(".notice")).to_contain_text("Test save failed")
+    await expect(row).to_have_count(1)
+    await expect(row.locator(".checkbox")).to_have_attribute("aria-pressed", "false")
+    await expect(row).not_to_have_class(re.compile(r"\bcompleting\b"))
+    await page.unroute("**/api/tasks/*/local", fail_save)
+
+    await page.evaluate(
+        """() => {
+            window.taskAnimations = [];
+            document.addEventListener('animationstart', event => {
+                if (event.animationName.startsWith('task-')) {
+                    window.taskAnimations.push(event.animationName);
+                }
+            });
+        }"""
+    )
+    release = asyncio.Event()
+
+    async def delay_save(route):
+        await release.wait()
+        await route.continue_()
+
+    await page.route("**/api/tasks/*/local", delay_save)
+    await row.get_by_role("button", name="Complete Read chapter 2", exact=True).click()
+    await expect(row).to_have_attribute("aria-busy", "true")
+    await expect(row.locator(".checkbox")).to_have_attribute("aria-pressed", "true")
+    await expect(row.locator(".task-title-text")).to_have_css("animation-name", "task-strike")
+    # The row must stay visible until the server actually accepts completion.
+    assert await row.is_visible()
+    release.set()
+    await expect(row).to_have_count(0)
+    await page.unroute("**/api/tasks/*/local", delay_save)
+    assert await page.evaluate("window.taskAnimations") == ["task-strike", "task-exit"]
+    await page.get_by_role("button", name="Done", exact=True).click()
+    await expect(row).to_have_count(1)
+    await row.get_by_role("button", name="Restore Read chapter 2", exact=True).click()
+    await expect(row).to_have_count(0)
+    await page.get_by_role("button", name="To do", exact=True).click()
+    await expect(row).to_have_count(1)
+
+    await page.emulate_media(reduced_motion="reduce")
+    await page.evaluate("window.taskAnimations = []")
+    await row.get_by_role("button", name="Complete Read chapter 2", exact=True).click()
+    await expect(row).to_have_count(0)
+    assert await page.evaluate("window.taskAnimations") == []
+    await page.get_by_role("button", name="Done", exact=True).click()
+    await row.get_by_role("button", name="Restore Read chapter 2", exact=True).click()
+    await page.get_by_role("button", name="To do", exact=True).click()
+    await expect(row).to_have_count(1)
+    await page.emulate_media(reduced_motion="no-preference")
+
+
+async def check_source_status_views(page):
+    from coursedeck.task_state import project_task_state
+
+    async def source_states(route):
+        # This route changes the representation, so the backend's ETag is not ours.
+        response = await route.fetch(
+            headers={
+                key: value
+                for key, value in route.request.headers.items()
+                if key.lower() != "if-none-match"
+            }
+        )
+        snapshot = await response.json()
+        original = snapshot["tasks"][0]
+        snapshot["tasks"] += [
+            original
+            | {
+                "id": f"fixture-{availability}-{known}",
+                "title": title,
+                "submission_status": "submitted",
+                "source_availability": availability,
+                "source_status_known": known,
+            }
+            for title, availability, known in [
+                ("Source confirmed", "present", True),
+                ("Source missing", "missing", True),
+                ("Source stale", "present", False),
+                ("Source unconfirmed", "unconfirmed", False),
+            ]
+        ]
+        for task in snapshot["tasks"]:
+            task.update(project_task_state(task))
+        await route.fulfill(response=response, json=snapshot)
+
+    await page.route("**/api/snapshot", source_states)
+    await page.reload()
+    await expect(page.locator(".task-row")).to_have_count(4)
+    for title, label in [
+        ("Source missing", "Not found in source"),
+        ("Source stale", "Status unknown"),
+        ("Source unconfirmed", "Not refreshed"),
+    ]:
+        row = page.locator(".task-row").filter(has_text=title)
+        await expect(row.locator(".task-source-warning")).to_have_text(label)
+        await expect(row.locator(".checkbox")).to_have_attribute("aria-pressed", "false")
+    await page.get_by_role("button", name="Done", exact=True).click()
+    await expect(page.locator(".task-row")).to_have_count(1)
+    await expect(
+        page.get_by_role("button", name="Completed at source: Source confirmed", exact=True)
+    ).to_be_disabled()
+    await page.unroute("**/api/snapshot", source_states)
+    await page.reload()
+    await expect(page.locator(".task-row")).to_have_count(1)
+
+
 async def main():
     with tempfile.TemporaryDirectory(prefix="coursedeck-smoke-") as folder:
         db = Database(Path(folder) / "coursedeck.sqlite3")
         db.save_settings(Settings(startup_sync=False))
-        course = Course(provider="google_classroom", external_id="123", name="Biology fixture")
+        course = Course(
+            provider="google_classroom",
+            external_id="123",
+            name="Biology fixture",
+            section="BIO-101",
+        )
         task = Task(
             provider=course.provider,
             course_external_id=course.external_id,
@@ -302,11 +460,12 @@ async def main():
                     raise RuntimeError("Isolated backend did not start")
             await check_ui(base_url)
         finally:
-            process.terminate()
-            process.wait(timeout=10)
+            from scripts.smoke_support import stop_backend
+
+            stop_backend(process)
     print(
-        "Browser smoke passed: course binding, notes, heartbeat failure/timeout/recovery, "
-        "dark UI, mobile."
+        "Browser smoke passed: course alignment/binding, source status views, completion "
+        "animation/save failure/reduced motion, notes, heartbeat recovery, dark UI, mobile."
     )
 
 

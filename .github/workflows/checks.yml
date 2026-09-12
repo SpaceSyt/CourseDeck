@@ -1,0 +1,106 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Python (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: '3.12'
+      - run: uv sync --frozen
+      - run: uv run ruff check coursedeck tests scripts
+      - run: uv run python scripts/export_task_contract.py --check
+      - run: uv run playwright install --with-deps chromium
+      # Includes migration upgrades, rollback, damaged backups, and task edit conflicts.
+      # Tests use temporary databases and fixture connectors, never saved accounts.
+      - run: uv run pytest -q
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm test
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/dist
+          retention-days: 3
+
+  browser:
+    name: Browser (${{ matrix.suite }})
+    needs: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - smoke_ui
+          - smoke_chat_ui
+          - smoke_chat_stream_ui
+          - smoke_material_search
+          - smoke_changes_ui
+          - smoke_associations_ui
+          - smoke_mail_rules_ui
+          - smoke_recovery_ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: '3.12'
+      - run: uv sync --frozen
+      - run: uv run playwright install --with-deps chromium
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/dist
+      - uses: actions/setup-node@v4
+        if: matrix.suite == 'smoke_associations_ui'
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm --prefix frontend ci
+        if: matrix.suite == 'smoke_associations_ui'
+      - run: uv run python -m scripts.${{ matrix.suite }}
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-${{ matrix.suite }}-screenshots
+          path: data/debug/*.png
+          if-no-files-found: ignore
+          retention-days: 3

@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 
 from ..domain import SyncResult
+from .capabilities import connector_capabilities, reading_capabilities
 
 
 class Connector(ABC):
@@ -8,6 +9,13 @@ class Connector(ABC):
     display_name: str
     description: str = ""
     manual_login = False
+
+    @property
+    def reading_capabilities(self):
+        active = getattr(self, "active", None)
+        if active is not None and active is not self:
+            return connector_capabilities(active, self.key)
+        return reading_capabilities(self.key)
 
     @property
     def configuration_fields(self) -> list[dict]:

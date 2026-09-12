@@ -4,7 +4,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from playwright.async_api import Error as BrowserError
 
-from ..domain import Course, Outcome, SyncResult, Task
+from ..domain import Course, Outcome, SyncResult, Task, TaskScope
 from .browser_base import BrowserConnector, is_login, session_html
 from .dates import source_date
 from .http import TransportError
@@ -76,12 +76,17 @@ def parse_assignments(
         lowered = status_text.lower()
         if grade:
             status = "graded"
-        elif any(s in lowered for s in ["no submission", "not submitted", "unsubmitted"]):
+        elif any(
+            s in lowered
+            for s in ["no submission", "not submitted", "unsubmitted", "awaiting submission"]
+        ):
             status = "open"
-        elif "submitted" in lowered or "submission" in lowered:
-            status = "submitted"
         elif "missing" in lowered:
             status = "missing"
+        elif re.fullmatch(r"submitted(?:\s*\(?late\)?)?", lowered):
+            status = "submitted"
+        elif lowered == "graded":
+            status = "graded"
         date_nodes = row.select(".submissionTimeChart--dueDate[datetime]")
         release = row.select_one(".submissionTimeChart--releaseDate[datetime]")
         raw_dates = {
@@ -108,7 +113,7 @@ def parse_assignments(
             title=title,
             **dates,
             submission_status=status,
-            graded=bool(grade),
+            graded=status == "graded",
             score=float(grade[1]) if grade else None,
             points_possible=float(grade[2]) if grade else None,
             url=urljoin(course.source_url, str(link["href"]))
@@ -123,12 +128,30 @@ def parse_assignments(
     return list(tasks.values()), warnings
 
 
+def assignment_list_complete(html: str, warnings: list[str]) -> bool:
+    """Only the known unfiltered, unpaginated student table covers absent assignments."""
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.select_one("#assignments-student-table")
+    if warnings or table is None:
+        return False
+    if soup.select_one(
+        '.pagination, .dataTables_paginate, [aria-label*="pagination" i], '
+        '[aria-label*="next page" i], a[rel="next"], '
+        'input[type="search"][value]:not([value=""])'
+    ):
+        return False
+    if table.select_one('[data-filtered="true"], [data-has-more="true"], [aria-busy="true"]'):
+        return False
+    return all(
+        row.select_one('a[href*="/assignments/"], [data-assignment-id]') is not None
+        for row in table.select("tbody tr")
+    )
+
+
 class GradescopeConnector(BrowserConnector):
     key = "gradescope"
     display_name = "Gradescope"
-    description = (
-        "Dedicated browser login for SSO / 2FA. Student-page parser; live validation pending."
-    )
+    description = "Gradescope student assignments, deadlines and submission status."
     default_url = "https://www.gradescope.com"
     login_path = "/account"
 
@@ -146,23 +169,51 @@ class GradescopeConnector(BrowserConnector):
         result = SyncResult(
             outcome=Outcome.SUCCESS,
             complete=False,
-            metadata={"transport": "browser_session_http", "coverage": "student_course_pages"},
+            metadata={"transport": "browser_dom", "coverage": "student_course_pages"},
         )
         try:
             async with self.browser.session(self.config.get("timezone")) as context:
-                result.courses = parse_courses(
-                    await session_html(context, self.base_url + "/account"), self.base_url
+                page = await context.new_page()
+                await page.goto(
+                    self.base_url + "/account", wait_until="domcontentloaded", timeout=45000
                 )
+                await page.locator('a[href*="/courses/"], input[type="password"]').first.wait_for(
+                    state="attached", timeout=25000
+                )
+                result.courses = parse_courses(await page.content(), self.base_url)
                 for course in result.courses:
                     try:
-                        html = await session_html(context, course.source_url)
+                        response = await page.goto(
+                            course.source_url, wait_until="domcontentloaded", timeout=45000
+                        )
+                        if response and response.status == 429:
+                            raise TransportError(
+                                Outcome.RATE_LIMITED, "Gradescope rate limited this request."
+                            )
+                        if is_login(await page.content()):
+                            raise TransportError(
+                                Outcome.AUTH_REQUIRED, "Gradescope requires login."
+                            )
+                        await page.locator("#assignments-student-table").wait_for(
+                            state="attached", timeout=25000
+                        )
+                        html = await page.content()
                         tasks, warnings = parse_assignments(
                             html, course, self.config.get("timezone")
                         )
                         result.tasks.extend(tasks)
                         result.warnings.extend(warnings)
+                        if assignment_list_complete(html, warnings):
+                            result.covered_task_scopes.append(
+                                TaskScope(course_external_id=course.external_id)
+                            )
                     except TransportError as exc:
                         result.warnings.append(exc.safe_message)
+                        result.outcome = Outcome.PARTIAL
+                    except BrowserError:
+                        result.warnings.append(
+                            "A Gradescope course page did not load reliably. Cached tasks retained."
+                        )
                         result.outcome = Outcome.PARTIAL
         except TransportError as exc:
             result.outcome = Outcome.PARTIAL if result.tasks else exc.outcome

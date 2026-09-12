@@ -9,7 +9,9 @@ from playwright.async_api import Error as BrowserError
 from playwright.async_api import TimeoutError as BrowserTimeout
 
 from ..credentials import CredentialStore
-from ..domain import Course, Outcome, SyncResult, Task
+from ..domain import Course, Outcome, SyncResult, Task, TaskScope
+from .brightspace_activities import BrightspaceActivities
+from .brightspace_browser_status import BrightspaceBrowserStatus
 from .browser_base import BrowserConnector, session_html
 from .dates import source_date
 from .http import TransportError, json_get
@@ -53,6 +55,9 @@ def map_folder(course_id: str, raw: dict, submissions: list | None, base_url: st
                 "graded": graded,
                 "score": feedback.get("Score"),
             },
+            "unavailable_fields": ["submission_status", "graded", "score"]
+            if submissions is None
+            else [],
         },
     )
 
@@ -75,8 +80,19 @@ def map_scheduled_item(course: Course, raw: dict) -> Task:
             unavailable.append(key)
     if raw.get("IsExempt"):
         dates["due_at"] = None
-    # Reading a content page can complete it in Brightspace; that does not prove an assignment
-    # was submitted. Keep this distinction instead of hiding a deadline as completed.
+    # A file's required reading can be completed in the content tool. Opening an LTI link
+    # or an assignment wrapper does not prove its underlying work was submitted.
+    status = "unknown"
+    if (
+        raw.get("ActivityType") == 1
+        and raw.get("CompletionType") in {1, 2}
+        and "DateCompleted" in raw
+        and not raw.get("IsExempt")
+    ):
+        try:
+            status = "completed" if source_date(raw["DateCompleted"]) else "open"
+        except (ValueError, TypeError):
+            unavailable.append("submission_status")
     return Task(
         provider="brightspace",
         external_id=f"content-{item_id}",
@@ -86,11 +102,12 @@ def map_scheduled_item(course: Course, raw: dict) -> Task:
         url=f"{urlparse(course.source_url).scheme}://{urlparse(course.source_url).netloc}"
         f"/d2l/le/content/{course.external_id}/Home?itemIdentifier="
         f"D2L.LE.Content.ContentObject.{item_type}-{item_id}",
-        submission_status="unknown",
+        submission_status=status,
         raw_data={
             "parser": "scheduled_content",
             "activity_type": raw.get("ActivityType"),
             "content_completed_at": raw.get("DateCompleted"),
+            "completion_type": raw.get("CompletionType"),
             "exempt": raw.get("IsExempt", False),
             "source_link_available": bool(raw.get("ItemUrl")),
             "unavailable_fields": unavailable,
@@ -101,15 +118,28 @@ def map_scheduled_item(course: Course, raw: dict) -> Task:
 class BrightspaceAPITransport:
     """Same API mapper for OAuth HTTP and authenticated browser-context requests."""
 
-    def __init__(self, get_json, base_url: str, lp_version: str, le_version: str):
+    def __init__(
+        self,
+        get_json,
+        base_url: str,
+        lp_version: str,
+        le_version: str,
+        known_content_ids: set[tuple[str, str]] | None = None,
+        browser_status=None,
+    ):
         self.get = get_json
         self.base_url, self.lp, self.le = base_url, lp_version, le_version
+        self.known_content_ids = known_content_ids or set()
+        self.browser_status = browser_status
 
     async def scheduled_content(self, course, result):
+        """Read explicit content deadlines without promoting ordinary course materials."""
         endpoint = f"/d2l/api/le/{self.le}/{course.external_id}/content/myItems/"
         path, seen = endpoint, set()
+        records_complete = True
         for _ in range(1000):
-            body = await self.get(path, None)
+            # Any includes completed items; an overdue-only view would falsely lose them.
+            body = await self.get(path, {"completion": 1} if path == endpoint else None)
             if (
                 not isinstance(body, dict)
                 or not isinstance(body.get("Objects"), list)
@@ -123,17 +153,31 @@ class BrightspaceAPITransport:
                     if not isinstance(raw, dict) or "ItemId" not in raw or "DueDate" not in raw:
                         raise ValueError("Incomplete content record")
                     result.metadata["content_items_checked"] += 1
-                    if raw.get("DueDate"):
+                    if (
+                        raw.get("DueDate")
+                        or (course.external_id, f"content-{raw['ItemId']}")
+                        in self.known_content_ids
+                    ):
                         task = map_scheduled_item(course, raw)
                         result.tasks.append(task)
                         if task.raw_data["unavailable_fields"]:
                             result.warnings.append(
                                 f"{course.name}: {task.title} — a date could not be read."
                             )
+                        # The independent material collector reads file bodies once. Keep
+                        # previously cached text until it supplies fresh content evidence.
+                        task.raw_data["unavailable_fields"].append("description")
                 except (KeyError, ValueError, TypeError):
+                    records_complete = False
                     result.warnings.append(f"{course.name}: a content item could not be read.")
             next_url = body["Next"]
             if next_url is None:
+                if records_complete:
+                    result.covered_task_scopes.append(
+                        TaskScope(
+                            course_external_id=course.external_id, external_id_prefix="content-"
+                        )
+                    )
                 return
             if not isinstance(next_url, str) or not next_url:
                 raise TransportError(Outcome.PARSE_ERROR, "Content pagination link was invalid.")
@@ -159,15 +203,27 @@ class BrightspaceAPITransport:
         result = SyncResult(
             outcome=Outcome.PARTIAL,
             complete=False,
-            warnings=[
-                "Synced assignment folders and dated course content. "
-                "Standalone quizzes, discussions and announcements are not yet covered."
-            ],
+            warnings=[],
             metadata={
                 "transport": "official_api",
-                "coverage": "dropbox_and_dated_content",
+                "coverage": "assignments_quizzes_dated_content_and_discussions",
                 "content_items_checked": 0,
             },
+        )
+        user_id = None
+        try:
+            identity = await self.get(f"/d2l/api/lp/{self.lp}/users/whoami", None)
+            if isinstance(identity, dict) and str(identity.get("Identifier", "")).isdecimal():
+                user_id = str(identity["Identifier"])
+        except TransportError:
+            pass
+        activities = BrightspaceActivities(
+            self.get,
+            self.base_url,
+            self.le,
+            user_id,
+            known_activity_ids=self.known_content_ids,
+            quiz_status=self.browser_status.quiz if self.browser_status else None,
         )
         try:
             bookmark, seen = None, set()
@@ -200,6 +256,8 @@ class BrightspaceAPITransport:
                             raise TransportError(
                                 Outcome.PARSE_ERROR, "Dropbox schema was not recognized."
                             )
+                        folders_complete = True
+                        folder_tasks, status_warnings = {}, {}
                         for folder in folders:
                             submissions = None
                             try:
@@ -212,30 +270,84 @@ class BrightspaceAPITransport:
                                         Outcome.PARSE_ERROR, "Submission schema was not recognized."
                                     )
                             except TransportError as exc:
-                                result.warnings.append(
+                                submissions = None
+                                status_warnings[str(folder["Id"])] = (
                                     f"{course.name}: {folder.get('Name', folder.get('Id'))} — "
                                     f"submission status: {exc.safe_message}"
                                 )
                             try:
-                                result.tasks.append(
-                                    map_folder(cid, folder, submissions, self.base_url)
-                                )
+                                task = map_folder(cid, folder, submissions, self.base_url)
+                                result.tasks.append(task)
+                                folder_tasks[str(folder["Id"])] = task
                             except (KeyError, ValueError, TypeError):
+                                folders_complete = False
                                 result.warnings.append(
                                     f"{course.name}: an assignment could not be read."
                                 )
+                        if self.browser_status:
+                            try:
+                                statuses = await self.browser_status.folders(course, folders)
+                                for folder_id, summary in statuses.items():
+                                    if (
+                                        folder_id not in folder_tasks
+                                        or summary["status"] == "unknown"
+                                    ):
+                                        continue
+                                    task = folder_tasks[folder_id]
+                                    if (
+                                        task.submission_status
+                                        in {"submitted", "graded", "completed"}
+                                        and summary["status"] == "open"
+                                    ):
+                                        task.raw_data["unavailable_fields"].append(
+                                            "submission_status"
+                                        )
+                                        task.raw_data["submission_summary"]["known"] = False
+                                        result.warnings.append(
+                                            f"{course.name}: {task.title} — "
+                                            "submission status conflicts between the page and API."
+                                        )
+                                        continue
+                                    # Preserve API grading evidence, otherwise prefer the actual
+                                    # completion label (also covers on-paper/in-person work).
+                                    if task.submission_status != "graded":
+                                        task.submission_status = summary["status"]
+                                    task.raw_data["submission_summary"].update(
+                                        {
+                                            "known": True,
+                                            "evidence": summary["evidence"],
+                                            "submitted": task.submission_status
+                                            in {"submitted", "graded", "completed"},
+                                        }
+                                    )
+                                    task.raw_data["unavailable_fields"] = [
+                                        key
+                                        for key in task.raw_data["unavailable_fields"]
+                                        if key != "submission_status"
+                                    ]
+                                    status_warnings.pop(folder_id, None)
+                            except TransportError as exc:
+                                result.warnings.append(f"{course.name}: {exc.safe_message}")
+                        result.warnings.extend(status_warnings.values())
+                        if folders_complete:
+                            result.covered_task_scopes.append(
+                                TaskScope(course_external_id=cid, external_id_prefix="dropbox-")
+                            )
                     except TransportError as exc:
                         result.warnings.append(f"{course.name}: assignments — {exc.safe_message}")
                     try:
                         await self.scheduled_content(course, result)
                     except TransportError as exc:
                         result.warnings.append(f"{course.name}: dated content — {exc.safe_message}")
+                    await activities.quizzes(course, result)
+                    await activities.discussions(course, result)
                 paging = body.get("PagingInfo")
                 if not isinstance(paging, dict) or not isinstance(paging.get("HasMoreItems"), bool):
                     raise TransportError(
                         Outcome.PARSE_ERROR, "Enrollment pagination metadata missing."
                     )
                 if not paging["HasMoreItems"]:
+                    result.outcome = Outcome.PARTIAL if result.warnings else Outcome.SUCCESS
                     return result
                 bookmark = paging.get("Bookmark")
                 if not bookmark or bookmark in seen:
@@ -523,6 +635,11 @@ class BrightspaceConnector(BrowserConnector):
                 outcome=Outcome.AUTH_REQUIRED, warnings=["Connect Brightspace first."]
             )
         lp, le = self.config.get("lp_version", "1.49"), self.config.get("le_version", "1.82")
+        known_content_ids = {
+            (task["course_external_id"], task["external_id"])
+            for task in self.db.tasks()
+            if task["provider"] == self.key
+        }
         try:
             if self.config.get("transport") == "api":
                 token = await self.api_token()
@@ -533,14 +650,22 @@ class BrightspaceConnector(BrowserConnector):
                     async def get(path, params):
                         return await json_get(client, path, params)
 
-                    return await BrightspaceAPITransport(get, self.base_url, lp, le).sync()
+                    return await BrightspaceAPITransport(
+                        get, self.base_url, lp, le, known_content_ids
+                    ).sync()
             async with self.browser.session(self.config.get("timezone")) as context:
                 await self.restore_browser_session(context)
 
                 async def get(path, params):
-                    response = await context.request.get(
-                        self.base_url + path, params=params, timeout=30000
-                    )
+                    try:
+                        response = await context.request.get(
+                            self.base_url + path, params=params, timeout=30000
+                        )
+                    except BrowserError as exc:
+                        raise TransportError(
+                            Outcome.NETWORK_ERROR,
+                            "Brightspace request failed; previously read records retained.",
+                        ) from exc
                     if response.status != 200:
                         outcome = (
                             Outcome.RATE_LIMITED
@@ -558,12 +683,23 @@ class BrightspaceConnector(BrowserConnector):
                         )
                     try:
                         return await response.json()
+                    except BrowserError as exc:
+                        raise TransportError(
+                            Outcome.NETWORK_ERROR, "Brightspace response could not be read."
+                        ) from exc
                     except ValueError as exc:
                         raise TransportError(
                             Outcome.PARSE_ERROR, "Browser API returned non-JSON content."
                         ) from exc
 
-                result = await BrightspaceAPITransport(get, self.base_url, lp, le).sync()
+                result = await BrightspaceAPITransport(
+                    get,
+                    self.base_url,
+                    lp,
+                    le,
+                    known_content_ids,
+                    BrightspaceBrowserStatus(context, self.base_url),
+                ).sync()
                 result.metadata["transport"] = "browser_session_api"
                 if not result.courses and result.outcome in {
                     Outcome.AUTH_REQUIRED,

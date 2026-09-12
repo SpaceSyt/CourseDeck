@@ -1,4 +1,14 @@
+import type {
+  FieldAvailability,
+  SourceAvailability,
+  SourceState,
+  TaskField,
+} from './task-contract-types';
+
 export interface LocalState {
+  due_override?: boolean;
+  due_at_override?: string | null;
+  completion_override?: 'done' | 'open' | null;
   hidden: boolean;
   dismissed: boolean;
   pinned: boolean;
@@ -6,7 +16,14 @@ export interface LocalState {
   priority: number;
 }
 export interface Task {
-  raw_data?: { unavailable_fields?: string[] };
+  source_state?: SourceState;
+  field_availability?: Partial<Record<TaskField, FieldAvailability>>;
+  is_completed?: boolean;
+  source_due_at?: string | null;
+  raw_data?: {
+    unavailable_fields?: string[];
+    field_availability?: Partial<Record<TaskField, FieldAvailability>>;
+  };
   id: string;
   provider: string;
   course_id: string | null;
@@ -18,6 +35,8 @@ export interface Task {
   available_at: string | null;
   url: string | null;
   submission_status: string;
+  source_availability?: SourceAvailability;
+  source_status_known?: boolean;
   graded: boolean;
   score: number | null;
   points_possible: number | null;
@@ -27,6 +46,7 @@ export interface Task {
   local: LocalState;
 }
 export interface Course {
+  color?: string | null;
   original_name?: string;
   alias?: string | null;
   disabled?: boolean;
@@ -44,6 +64,17 @@ export interface Course {
   source_url: string | null;
 }
 export interface Source {
+  metadata?: {
+    diagnostics?: {
+      stage?: string;
+      category?: string;
+      retry_attempt?: number;
+      retry_limit?: number;
+      next_retry_at?: string | null;
+      action?: string;
+    };
+    [key: string]: unknown;
+  };
   manual_login: boolean;
   configuration_fields?: {
     key: string;
@@ -70,6 +101,7 @@ export interface Settings {
   show_completed: boolean;
 }
 export interface Snapshot {
+  changes?: { unread_count: number; critical_unread_count: number };
   source_courses: Course[];
   tasks: Task[];
   courses: Course[];
@@ -87,6 +119,8 @@ export interface SyncLog {
 }
 
 export interface MailMessage {
+  attention?: boolean;
+  attention_reasons?: string[];
   id: string;
   sender: string;
   sender_email: string;
@@ -129,6 +163,8 @@ export interface MailPage {
 }
 
 export interface MailRule {
+  priority?: boolean;
+  enabled: boolean;
   id: string;
   field: 'sender' | 'subject' | 'body' | 'any';
   contains: string;

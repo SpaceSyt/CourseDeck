@@ -3,7 +3,14 @@ from fastapi.testclient import TestClient
 from coursedeck.app import create_app
 from coursedeck.db import Database
 from coursedeck.domain import Course, Outcome, SyncResult, now
-from coursedeck.mail import CustomTaskInput, MailMessage, MailRule, MailStore, save_custom_task
+from coursedeck.mail import (
+    DEFAULT_MAIL_RULES,
+    CustomTaskInput,
+    MailMessage,
+    MailRule,
+    MailStore,
+    save_custom_task,
+)
 
 
 def setup(tmp_path):
@@ -67,13 +74,79 @@ def test_rules_ignore_restore_and_sync_preserve_local_state(tmp_path):
     store.upsert(message("conflict", body="Intro to Writing survey"))
     assert not store.get("conflict")["ignored"]
     store.delete_rule(key)
-    assert store.rules() == []
+    assert key not in {rule["id"] for rule in store.rules()}
     store.add_rule(
         MailRule(
             field="sender", contains="teacher@example.test", action="course", value=courses[1].id
         )
     )
     assert store.get("one")["classification"] == "unclassifiable"
+
+
+def test_default_keywords_can_be_disabled_edited_deleted_and_explicitly_restored(tmp_path):
+    db, store, _ = setup(tmp_path)
+    store.upsert(message())
+    defaults = {rule["id"]: rule for rule in store.rules()}
+    assert set(defaults) == set(DEFAULT_MAIL_RULES)
+    survey = MailRule.model_validate(
+        {k: v for k, v in defaults["builtin:survey"].items() if k != "id"}
+    )
+    store.update_rule("builtin:survey", survey.model_copy(update={"enabled": False}))
+    assert store.get("one")["categories"] == []
+    restarted = MailStore(Database(db.path))
+    assert not next(r for r in restarted.rules() if r["id"] == "builtin:survey")["enabled"]
+    assert restarted.get("one")["categories"] == []
+    restarted.update_rule("builtin:survey", survey.model_copy(update={"value": "Questionnaire"}))
+    assert restarted.get("one")["categories"] == ["Questionnaire"]
+    for rule in restarted.rules():
+        restarted.delete_rule(rule["id"])
+    restarted = MailStore(Database(db.path))
+    assert restarted.rules() == []
+    assert restarted.get("one")["categories"] == []
+    custom = restarted.add_rule(
+        MailRule(field="body", contains="complete", action="category", value="Reply")
+    )
+    restarted.reset_defaults()
+    assert custom in {r["id"] for r in restarted.rules()}
+    assert restarted.get("one")["categories"] == ["Reply", "Survey"]
+
+
+def test_custom_keyword_edits_reclassify_cached_mail_without_overriding_local_choices(tmp_path):
+    _, store, courses = setup(tmp_path)
+    store.upsert(message(subject="Homework", body="Please review worksheet Alpha."))
+    key = store.add_rule(
+        MailRule(field="body", contains="Alpha", action="course", value=courses[0].id)
+    )
+    assert store.get("one")["course_id"] == courses[0].id
+    store.update_rule(
+        key, MailRule(field="body", contains="Alpha", action="course", value=courses[1].id)
+    )
+    assert store.get("one")["course_id"] == courses[1].id
+    store.add_rule(MailRule(field="body", contains="Alpha", action="course", value=courses[0].id))
+    store.add_rule(MailRule(field="body", contains="Alpha", action="ignore"))
+    assert store.get("one")["classification"] == "unclassifiable"
+    assert not store.get("one")["ignored"]
+    store.patch("one", {"course_id": "none", "ignored": False, "deleted": True})
+    store.update_rule(
+        key, MailRule(field="body", contains="Beta", action="category", value="Later")
+    )
+    mail = store.get("one")
+    assert mail["classification"] == "none" and not mail["ignored"] and mail["deleted"]
+    assert "Later" not in mail["categories"]
+
+
+def test_existing_custom_rules_are_preserved_when_defaults_are_first_seeded(tmp_path):
+    db, store, _ = setup(tmp_path)
+    legacy = {"field": "subject", "contains": "worksheet", "action": "category", "value": "Read"}
+    with db.connection() as conn:
+        import json
+
+        conn.execute("INSERT INTO mail_rules VALUES (?, ?)", ("legacy", json.dumps(legacy)))
+    rules = {r["id"]: r for r in store.rules()}
+    assert rules["legacy"] == legacy | {"id": "legacy", "enabled": True, "priority": False}
+    assert len(rules) == len(DEFAULT_MAIL_RULES) + 1
+    store.upsert(message(subject="worksheet", body="", body_complete=True))
+    assert store.get("one")["categories"] == ["Read"]
 
 
 def test_changed_thread_never_reuses_stale_body_for_classification(tmp_path):
@@ -147,3 +220,28 @@ def test_mail_endpoints_validation_isolation_and_pagination(tmp_path):
         client.patch("/api/mail/messages/0", json={"course_id": "bad"}, headers=headers).status_code
         == 400
     )
+
+
+def test_mail_rule_edit_endpoints_validate_and_update_cached_messages(tmp_path):
+    app = create_app(tmp_path)
+    store = MailStore(app.state.db)
+    store.upsert(message(subject="Campus", body="Fill in the questionnaire.", body_complete=True))
+    client = TestClient(app, base_url="http://127.0.0.1")
+    headers = {"X-CourseDeck": "1"}
+    rules = client.get("/api/mail/rules").json()
+    original = next(rule for rule in rules if rule["id"] == "builtin:survey")
+    payload = {key: value for key, value in original.items() if key != "id"}
+    payload["contains"] = "questionnaire"
+    path = "/api/mail/rules/builtin:survey"
+    assert client.put(path, json=payload).status_code == 403
+    assert client.put(path, json=payload | {"field": "bad"}, headers=headers).status_code == 422
+    assert client.put(path, json=payload | {"value": ""}, headers=headers).status_code == 400
+    assert client.put("/api/mail/rules/missing", json=payload, headers=headers).status_code == 404
+    assert client.put(path, json=payload, headers=headers).json() == {"id": "builtin:survey"}
+    assert client.get("/api/mail/messages/one").json()["categories"] == ["Survey"]
+    assert client.delete(path, headers=headers).status_code == 200
+    assert client.get("/api/mail/messages/one").json()["categories"] == []
+    assert client.post("/api/mail/rules/reset-defaults").status_code == 403
+    assert client.post("/api/mail/rules/reset-defaults", headers=headers).status_code == 200
+    restored = client.get("/api/mail/rules").json()
+    assert next(rule for rule in restored if rule["id"] == "builtin:survey") == original

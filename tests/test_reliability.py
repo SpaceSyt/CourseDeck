@@ -27,7 +27,7 @@ def test_parse_failure_does_not_erase_previously_known_deadline(tmp_path):
     assert db.tasks()[0]["due_at"] is None  # a positively confirmed removed due date is different
 
 
-async def test_slow_or_broken_connector_cannot_block_other_provider(tmp_path):
+async def test_serial_sync_continues_after_a_broken_connector(tmp_path):
     db = Database(tmp_path / "db")
     fast = FakeConnector(db)
     await fast.connect()
@@ -44,11 +44,13 @@ async def test_slow_or_broken_connector_cannot_block_other_provider(tmp_path):
     engine = SyncEngine(db, [fast, broken])
     job = asyncio.create_task(engine.sync_one("broken"))
     await entered.wait()
-    await engine.sync_one("fixture")
-    assert len(db.tasks()) == 6
+    queued = asyncio.create_task(engine.sync_one("fixture"))
+    await asyncio.sleep(0)
+    assert not db.tasks()
     assert "broken" in engine.running
     release.set()
-    await job
+    await asyncio.gather(job, queued)
+    assert len(db.tasks()) == 6
     assert db.state("broken")["last_outcome"] == "error"
     assert "NEVER_LOG_THIS" not in json.dumps(db.history())
 
