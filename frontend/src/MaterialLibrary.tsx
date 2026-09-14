@@ -134,6 +134,7 @@ export function MaterialLibrary({
           <option value="brightspace">Brightspace</option>
           <option value="gradescope">Gradescope</option>
           <option value="webassign">WebAssign</option>
+          <option value="rephactor">Rephactor</option>
         </select>
         <select aria-label="Material type" value={kind} onChange={(e) => setKind(e.target.value)}>
           <option value="">All types</option>

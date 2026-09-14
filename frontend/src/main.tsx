@@ -48,6 +48,7 @@ const names: Record<string, string> = {
   gradescope: 'Gradescope',
   webassign: 'WebAssign',
   brightspace: 'Brightspace',
+  rephactor: 'Rephactor',
   custom: 'Custom',
 };
 const safeUrl = (url: string | null) => (url && /^https?:\/\//i.test(url) ? url : undefined);

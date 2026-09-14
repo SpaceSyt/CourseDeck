@@ -6,6 +6,7 @@ from ..db import Database
 from .brightspace import BrightspaceConnector
 from .classroom_connection import ClassroomConnector
 from .gradescope import GradescopeConnector
+from .rephactor import RephactorConnector
 from .webassign import WebAssignConnector
 
 
@@ -25,5 +26,8 @@ def build_connectors(db: Database, data_dir: Path):
         ),
         BrightspaceConnector(
             db, BrowserManager(data_dir, "brightspace", channel=installed_chrome_channel()), vault
+        ),
+        RephactorConnector(
+            db, BrowserManager(data_dir, "rephactor", channel=installed_chrome_channel())
         ),
     ]

@@ -306,6 +306,10 @@ a:focus-visible {
   background: #332b42;
   color: #c7addf;
 }
+.course-icon.rephactor {
+  background: #422c35;
+  color: #e0a4b5;
+}
 .source-card > p,
 .source-card > small,
 .section-heading > span,

@@ -43,6 +43,7 @@ def test_upgrade_removes_demo_only_and_cannot_reenable_it(tmp_path):
         "gradescope",
         "webassign",
         "brightspace",
+        "rephactor",
     }
     assert (
         client.post("/api/sources/demo/connect", headers={"X-CourseDeck": "1"}).status_code == 404

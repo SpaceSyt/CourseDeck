@@ -232,6 +232,9 @@ nav {
 .dot.brightspace {
   background: #977fae;
 }
+.dot.rephactor {
+  background: #b97589;
+}
 .privacy {
   margin-top: auto;
   border: 1px solid #e5ebe6;
@@ -816,6 +819,10 @@ h2 {
 .course-icon.brightspace {
   background: #f5f0f8;
   color: #9881ab;
+}
+.course-icon.rephactor {
+  background: #faedf1;
+  color: #af7185;
 }
 .source-card h2 {
   display: flex;

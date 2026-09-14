@@ -170,7 +170,10 @@ async def check_ui(base_url):
         output.mkdir(parents=True, exist_ok=True)
         await page.screenshot(path=str(output / "todo-desktop.png"), full_page=True)
         await page.locator("nav").get_by_role("button", name="Sources", exact=True).click()
-        await expect(page.locator(".source-card")).to_have_count(4)
+        await expect(page.locator(".source-card")).to_have_count(5)
+        await expect(
+            page.locator("#source-rephactor").get_by_role("button", name="Connect", exact=True)
+        ).to_be_visible()
         classroom = page.locator("#source-google_classroom")
         await expect(classroom.get_by_role("button", name="Connect", exact=True)).to_be_visible()
         await classroom.get_by_role("button", name="Configure Google Classroom").click()

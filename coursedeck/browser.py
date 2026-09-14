@@ -27,7 +27,14 @@ class BrowserManager:
     """One dedicated persistent profile. Callers serialize access via provider locks."""
 
     def __init__(self, data_dir: Path, provider: str, channel: str | None = None):
-        if provider not in {"google_classroom", "gradescope", "webassign", "brightspace", "gmail"}:
+        if provider not in {
+            "google_classroom",
+            "gradescope",
+            "webassign",
+            "brightspace",
+            "rephactor",
+            "gmail",
+        }:
             raise ValueError("Unknown browser profile")
         self.root = (data_dir / "browser-profiles").resolve()
         self.path = (self.root / provider).resolve()
@@ -98,6 +105,7 @@ class BrowserManager:
             "gradescope",
             "webassign",
             "brightspace",
+            "rephactor",
             "gmail",
         }:
             raise ValueError("Refusing to reset a path outside the profile root")

@@ -15,6 +15,7 @@ CAPABILITIES = {
     "google_classroom": ReadingCapabilities(materials="classroom_pages", announcements=True),
     "gradescope": ReadingCapabilities(),
     "webassign": ReadingCapabilities(),
+    "rephactor": ReadingCapabilities(),
 }
 
 

@@ -36,8 +36,9 @@ def test_ambiguous_and_nonexistent_dates_rejected(value):
         source_date(value, "America/New_York")
 
 
-async def test_profile_reset_confined_to_provider(tmp_path):
-    browser = BrowserManager(tmp_path, "gradescope")
+@pytest.mark.parametrize("provider", ["gradescope", "rephactor"])
+async def test_profile_reset_confined_to_provider(tmp_path, provider):
+    browser = BrowserManager(tmp_path, provider)
     browser.path.mkdir(parents=True)
     (browser.path / "cookie-fixture").write_text("synthetic")
     other = tmp_path / "personal"
