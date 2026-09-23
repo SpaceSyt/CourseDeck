@@ -50,10 +50,13 @@ QUERY_KEYS = {
     "action",
 }
 BRIGHTSPACE_VIEWS = {
+    "/d2l/lms/dropbox/dropbox.d2l",
     "/d2l/lms/dropbox/user/folder_submit_files.d2l",
     "/d2l/lms/dropbox/user/folders_list.d2l",
     "/d2l/lms/quizzing/user/quiz_summary.d2l",
     "/d2l/lms/quizzing/user/quizzes_list.d2l",
+    "/d2l/lms/quizzing/quizzing.d2l",
+    "/d2l/lms/news/main.d2l",
 }
 
 
@@ -113,11 +116,14 @@ class CourseNavigation:
             match = re.search(r"/c/([^/]+)", root.path)
             return bool(match and re.match(rf"/(?:u/\d+/)?c/{re.escape(match[1])}(?:/|$)", p.path))
         if provider == "brightspace":
-            path_course = re.match(r"/d2l/(?:home|le/content|le)/(\d+)(?:/|$)", p.path)
+            path_course = re.match(r"/d2l/(?:home|le/content|le/lessons|le)/(\d+)(?:/|$)", p.path)
             if path_course and path_course[1] != cid:
                 return False
             return bool(
                 re.match(rf"/d2l/(?:home|le/content)/{re.escape(cid)}(?:/|$)", p.path)
+                or re.fullmatch(
+                    rf"/d2l/le/lessons/{re.escape(cid)}(?:/(?:topics|units)/\d+)?/?", p.path
+                )
                 or (reading_view and query.get("ou") == cid)
                 or re.match(rf"/d2l/le/{re.escape(cid)}/(?:discussions|news)/", p.path)
                 or re.match(rf"/content/enforced/{re.escape(cid)}[-/]", p.path)
@@ -142,6 +148,6 @@ def permitted_control(item):
     return bool(
         label
         and not WRITE.search(label)
-        and CONTROL.fullmatch(label)
+        and (item.get("nativeDisclosure") or CONTROL.fullmatch(label))
         and (item.get("kind") == "disclosure" or item.get("role") in {"button", "tab"})
     )

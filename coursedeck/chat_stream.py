@@ -2,6 +2,27 @@
 
 import json
 
+OUTPUT_TOKEN_LIMIT = 8192
+
+
+class CompletionLengthExceeded(ValueError):
+    pass
+
+
+def buffered_message(result):
+    choice = result["choices"][0]
+    if choice.get("finish_reason") == "length":
+        raise CompletionLengthExceeded("Provider reply reached its output limit")
+    if choice.get("finish_reason") not in {None, "stop", "tool_calls"}:
+        raise ValueError("Provider reply was incomplete")
+    message = choice["message"]
+    if not isinstance(message, dict):
+        raise ValueError("Invalid model response")
+    content = message.get("content") or ""
+    if not isinstance(content, str) or len(content) > 64000:
+        raise ValueError("Invalid or oversized model reply")
+    return message
+
 
 class VisibleText:
     def __init__(self):
@@ -39,7 +60,12 @@ class VisibleText:
 
 
 async def stream_completion(client, config, key, messages, tools, emit):
-    payload = {"model": config["model"], "messages": messages, "max_tokens": 2000, "stream": True}
+    payload = {
+        "model": config["model"],
+        "messages": messages,
+        "max_tokens": OUTPUT_TOKEN_LIMIT,
+        "stream": True,
+    }
     if tools:
         payload.update(tools=tools, tool_choice="auto")
     headers = {"Authorization": "Bearer " + key} if key else {}
@@ -60,7 +86,7 @@ async def stream_completion(client, config, key, messages, tools, emit):
             await emit({"type": "answer_start"})
             if "application/json" in response.headers.get("content-type", ""):
                 await response.aread()
-                message = response.json()["choices"][0]["message"]
+                message = buffered_message(response.json())
                 content = VisibleText().feed(message.get("content") or "", final=True)
                 await emit({"type": "activity", "label": "Provider returned a buffered reply"})
                 if content:
@@ -106,6 +132,8 @@ async def stream_completion(client, config, key, messages, tools, emit):
                         if len(call["function"][field]) > 32000:
                             raise ValueError("Tool arguments exceed limit")
                 if choice.get("finish_reason"):
+                    if choice["finish_reason"] == "length":
+                        raise CompletionLengthExceeded("Provider reply reached its output limit")
                     if choice["finish_reason"] not in {"stop", "tool_calls"}:
                         raise ValueError("Provider reply was incomplete")
                     finished = True

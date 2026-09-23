@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Archive,
@@ -38,6 +38,7 @@ import { Changes } from './Changes';
 import { TaskRelations } from './TaskRelations';
 import { TaskHistory } from './TaskHistory';
 import { RecoverySettings } from './RecoverySettings';
+import { DesktopStartup } from './DesktopStartup';
 import { api } from './api';
 import { courseColor, sourceSyncStatus } from './colors';
 import './style.css';
@@ -177,17 +178,23 @@ function App() {
     }
   };
   const zone = data?.settings.timezone ?? 'America/New_York';
+  const dateFormats = useMemo(
+    () =>
+      [false, true].map(
+        (full) =>
+          new Intl.DateTimeFormat('en-US', {
+            timeZone: zone,
+            month: 'short',
+            day: 'numeric',
+            ...(full ? { year: 'numeric' as const } : {}),
+            hour: 'numeric',
+            minute: '2-digit',
+          }),
+      ),
+    [zone],
+  );
   const date = (value: string | null, full = false) =>
-    value
-      ? new Intl.DateTimeFormat('en-US', {
-          timeZone: zone,
-          month: 'short',
-          day: 'numeric',
-          ...(full ? { year: 'numeric' as const } : {}),
-          hour: 'numeric',
-          minute: '2-digit',
-        }).format(new Date(value))
-      : 'No due date';
+    value ? dateFormats[Number(full)].format(new Date(value)) : 'No due date';
   const course = (task: Task) => data?.courses.find((c) => c.id === task.course_id);
   const activeCourses = data?.courses.filter((c) => !c.disabled && !c.deleted) ?? [];
   const courseEnabled = (t: Task) => !course(t)?.disabled && !course(t)?.deleted;
@@ -234,6 +241,13 @@ function App() {
         (a.due_at ?? '9999').localeCompare(b.due_at ?? '9999'),
     );
   const task = data?.tasks.find((t) => t.id === selected);
+  const groupedTasks = new Map<string, Task[]>();
+  for (const item of filtered) {
+    const group = bucket(item, zone, clock);
+    const rows = groupedTasks.get(group);
+    if (rows) rows.push(item);
+    else groupedTasks.set(group, [item]);
+  }
   return (
     <div className="shell">
       <aside className="sidebar">
@@ -612,7 +626,7 @@ function App() {
                     ) : (
                       ['Overdue', 'Today', 'Tomorrow', 'Next 7 days', 'Later', 'No due date'].map(
                         (group) => {
-                          const rows = filtered.filter((t) => bucket(t, zone, clock) === group);
+                          const rows = groupedTasks.get(group) ?? [];
                           return (
                             rows.length > 0 && (
                               <section className="task-group" key={group}>
@@ -1172,6 +1186,7 @@ function SettingsPage({
       <AISettings />
       <section>
         <h2>Preferences</h2>
+        <DesktopStartup />
         <label className="setting-row">
           <div>
             <b>Sync on startup</b>

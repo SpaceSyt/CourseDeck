@@ -26,21 +26,37 @@ export function sourceWarning(task: Task) {
     return 'Status unknown';
   return '';
 }
+let calendarFormats:
+  | { zone: string; key: Intl.DateTimeFormat; number: Intl.DateTimeFormat }
+  | undefined;
+
+function formats(zone: string) {
+  // The workspace uses one timezone; retain only its formatters, not formatted dates.
+  if (calendarFormats?.zone !== zone) {
+    calendarFormats = {
+      zone,
+      key: new Intl.DateTimeFormat('en-CA', {
+        timeZone: zone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }),
+      number: new Intl.DateTimeFormat('en-US', {
+        timeZone: zone,
+        year: 'numeric',
+        month: 'numeric',
+        day: 'numeric',
+      }),
+    };
+  }
+  return calendarFormats;
+}
+
 export function dayKey(date: Date, zone: string) {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: zone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(date);
+  return formats(zone).key.format(date);
 }
 export function dayNumber(date: Date, zone: string) {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: zone,
-    year: 'numeric',
-    month: 'numeric',
-    day: 'numeric',
-  }).formatToParts(date);
+  const parts = formats(zone).number.formatToParts(date);
   const value = (key: string) => Number(parts.find((p) => p.type === key)?.value);
   return Date.UTC(value('year'), value('month') - 1, value('day')) / 86400000;
 }

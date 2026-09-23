@@ -170,6 +170,7 @@ export interface MailRule {
   id: string;
   field: 'sender' | 'subject' | 'body' | 'any';
   contains: string;
-  action: 'course' | 'category' | 'ignore' | 'none';
+  action: 'course' | 'category' | 'ignore' | 'none' | 'filter';
+  match?: 'contains' | 'equals';
   value: string;
 }

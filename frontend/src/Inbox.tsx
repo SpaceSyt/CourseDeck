@@ -45,7 +45,7 @@ export function Inbox({
   const [deleted, setDeleted] = useState(false);
   const [ignored, setIgnored] = useState(false);
   const [offset, setOffset] = useState(0);
-  const [rules, setRules] = useState(false);
+  const [rules, setRules] = useState<'rules' | 'filters' | null>(null);
   const [ruleEmail, setRuleEmail] = useState<MailMessage | null>(null);
   const [attentionOnly, setAttentionOnly] = useState(false);
   const [priorityFirst, setPriorityFirst] = useState(false);
@@ -75,6 +75,24 @@ export function Inbox({
       request.current++;
     };
   }, [load]);
+  useEffect(() => {
+    const refresh = () => {
+      void load();
+      if (selected) {
+        const id = selected.id;
+        const version = ++detailRequest.current;
+        // GET keeps an explicit unread override; opening the detail again would mark it read.
+        void api<MailMessage>(`/mail/messages/${encodeURIComponent(id)}`)
+          .then((mail) => {
+            if (version === detailRequest.current)
+              setSelected((current) => (current?.id === id ? mail : current));
+          })
+          .catch(() => setError('Could not refresh email status.'));
+      }
+    };
+    window.addEventListener('coursedeck:inbox-changed', refresh);
+    return () => window.removeEventListener('coursedeck:inbox-changed', refresh);
+  }, [load, selected]);
   const open = useCallback(
     async (id: string) => {
       const version = ++detailRequest.current;
@@ -201,12 +219,21 @@ export function Inbox({
             </label>
             <button
               onClick={() => {
-                setRules(true);
+                setRules('rules');
                 setRuleEmail(null);
                 menu.current?.removeAttribute('open');
               }}
             >
               Mail rules
+            </button>
+            <button
+              onClick={() => {
+                setRules('filters');
+                setRuleEmail(null);
+                menu.current?.removeAttribute('open');
+              }}
+            >
+              Inbox filters
             </button>
             <button
               disabled={busy || connection?.syncing || connection?.status !== 'connected'}
@@ -371,7 +398,7 @@ export function Inbox({
             <button
               onClick={() => {
                 setRuleEmail(selected);
-                setRules(true);
+                setRules('rules');
               }}
             >
               Create rule
@@ -481,9 +508,11 @@ export function Inbox({
       )}
       {rules && (
         <MailRules
+          key={rules}
+          mode={rules}
           courses={courses}
           email={ruleEmail}
-          close={() => setRules(false)}
+          close={() => setRules(null)}
           changed={() => {
             void load();
             if (selected) void open(selected.id);

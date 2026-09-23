@@ -56,7 +56,8 @@ class MailRule(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     field: Literal["sender", "subject", "body", "any"]
     contains: str = Field(min_length=2, max_length=200)
-    action: Literal["course", "category", "ignore", "none"]
+    action: Literal["course", "category", "ignore", "none", "filter"]
+    match: Literal["contains", "equals"] = "contains"
     value: str = Field(default="", max_length=500)
     enabled: bool = True
     priority: bool = False
@@ -119,10 +120,14 @@ def normalized(value):
 
 
 def matches(needle, haystack):
+    return _matches_normalized(normalized(needle), normalized(haystack))
+
+
+def _matches_normalized(needle, haystack):
     # Word boundaries prevent e.g. 'art' matching 'department'.
     return (
-        re.search(r"(?<!\w)" + re.escape(normalized(needle)) + r"(?!\w)", normalized(haystack))
-        is not None
+        needle in haystack
+        and re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", haystack) is not None
     )
 
 
@@ -137,8 +142,24 @@ def mail_fields(mail):
     }
 
 
+def rule_matches(rule, fields):
+    return _rule_matches_normalized(rule, normalized(fields[rule["field"]]))
+
+
+def _rule_matches_normalized(rule, value):
+    needle = normalized(rule["contains"])
+    if rule.get("match") == "equals":
+        return needle == value
+    if rule["action"] == "filter":
+        return needle in value
+    return _matches_normalized(needle, value)
+
+
 def priority_match(rule, fields):
-    text = normalized(fields[rule["field"]])
+    return _priority_match_normalized(rule, normalized(fields[rule["field"]]))
+
+
+def _priority_match_normalized(rule, text):
     pattern = re.compile(r"(?<!\w)" + re.escape(normalized(rule["contains"])) + r"(?!\w)")
     return any(
         not re.search(
@@ -301,6 +322,7 @@ class MailStore:
             rules = [
                 {
                     "enabled": True,
+                    "match": "contains",
                     "priority": DEFAULT_MAIL_RULES[r["id"]].priority
                     if r["id"] in DEFAULT_MAIL_RULES
                     else False,
@@ -364,8 +386,10 @@ class MailStore:
             rule.value = course.get("workspace_id") or course["id"]
         if rule.action == "category" and not rule.value:
             raise ValueError("Enter a category")
-        if rule.action in {"none", "ignore"}:
+        if rule.action in {"none", "ignore", "filter"}:
             rule.value = ""
+        if rule.action == "filter":
+            rule.priority = False
         return rule
 
     def add_rule(self, rule):
@@ -453,27 +477,34 @@ class MailStore:
         courses = self.db.courses() if courses is None else courses
         rules = self.rules() if rules is None else rules
         fields = mail_fields(mail)
-        text = " ".join([mail["subject"], mail["snippet"], fields["body"]])
+        text = normalized(" ".join([mail["subject"], mail["snippet"], fields["body"]]))
+        # Mail bodies can be large. Normalize each searched field once per message,
+        # rather than repeating the full scan for every course name and rule.
+        normalized_fields = {"any": (text + " " + normalized(mail["sender_email"])).strip()}
+        for field in {rule["field"] for rule in rules if rule.get("enabled", True)} - {"any"}:
+            normalized_fields[field] = normalized(fields[field])
         hits, reasons, categories, attention = set(), [], set(), []
-        ignore, explicit_none, uncertain = False, False, False
+        ignore, explicit_none, uncertain, filtered = False, False, False, False
         for course in courses:
             for name in filter(
                 None, {course["name"], course.get("source_name"), *course.get("source_names", [])}
             ):
-                if len(normalized(name)) >= 4 and matches(name, text):
+                needle = normalized(name)
+                if len(needle) >= 4 and _matches_normalized(needle, text):
                     hits.add(course["id"])
                     reasons.append(name)
         for rule in rules:
             if not rule.get("enabled", True):
                 continue
-            hit = matches(rule["contains"], fields[rule["field"]])
+            value = normalized_fields[rule["field"]]
+            hit = _rule_matches_normalized(rule, value)
             if rule["field"] in {"body", "any"} and not mail["body_complete"] and not hit:
                 if rule["action"] in {"course", "none"}:
                     uncertain = True
                 continue
             if not hit:
                 continue
-            priority_hit = rule.get("priority") and priority_match(rule, fields)
+            priority_hit = rule.get("priority") and _priority_match_normalized(rule, value)
             if rule.get("priority") and rule["action"] == "category" and not priority_hit:
                 continue
             reasons.append(rule["contains"])
@@ -501,6 +532,8 @@ class MailStore:
                 explicit_none = True
             elif rule["action"] == "ignore":
                 ignore = True
+            elif rule["action"] == "filter":
+                filtered = True
         # A missing body may contain another course; never infer a confident absence.
         uncertain = uncertain or not mail["body_complete"]
         ambiguous = len(hits) > 1 or (explicit_none and bool(hits)) or uncertain
@@ -518,8 +551,9 @@ class MailStore:
             )
             course_id = resolved["id"] if resolved else None
             state = "classified" if resolved else "none" if override == "none" else "unclassifiable"
-        # Ambiguity never automatically removes a message from view.
-        ignored = local.get("ignored", ignore and state != "unclassifiable")
+        # Explicit Inbox filters use positive sender/content evidence independently of
+        # course classification. Keep uncertainty and the full cache; manual restore wins.
+        ignored = local.get("ignored", filtered or (ignore and state != "unclassifiable"))
         return {
             "classification": state,
             "course_id": course_id,
@@ -644,10 +678,7 @@ class MailStore:
                 after = self.classify(mail, local, courses, after_rules)
                 changed = any(before[key] != after[key] for key in keys)
                 fields = mail_fields(mail)
-                hit = any(
-                    rule and matches(rule["contains"], fields[rule["field"]])
-                    for rule in (current, proposed)
-                )
+                hit = any(rule and rule_matches(rule, fields) for rule in (current, proposed))
                 count["cached"] += 1
                 count["matched"] += bool(changed if value.operation == "reset-defaults" else hit)
                 count["changed"] += changed
@@ -692,16 +723,23 @@ class MailStore:
             course = resolve_course(self.db, patch["course_id"])
             patch["course_id"] = course.get("workspace_id") or course["id"]
         with self.db.connection() as conn:
-            row = conn.execute(
-                "SELECT local_payload FROM mail_messages WHERE id=?", (key,)
-            ).fetchone()
-            if not row:
-                raise KeyError(key)
-            conn.execute(
-                "UPDATE mail_messages SET local_payload=? WHERE id=?",
-                (json.dumps(json.loads(row[0]) | patch), key),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            self.patch_local(conn, key, patch)
         return self.get(key)
+
+    @staticmethod
+    def patch_local(conn, key, patch):
+        """Merge local flags inside the caller's transaction; never update source payload."""
+        row = conn.execute("SELECT local_payload FROM mail_messages WHERE id=?", (key,)).fetchone()
+        if not row:
+            raise KeyError(key)
+        before = json.loads(row[0])
+        after = before | patch
+        if before != after:
+            conn.execute(
+                "UPDATE mail_messages SET local_payload=? WHERE id=?", (json.dumps(after), key)
+            )
+        return before, after
 
 
 def build_mail_rules_router(db):

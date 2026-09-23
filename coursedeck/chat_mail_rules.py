@@ -22,12 +22,40 @@ def requested_edit(message, store):
     text = re.sub(r"^(?:请(?:帮我)?|帮我|please\s+)", "", message.strip(), flags=re.I)
     text = text.rstrip("。.!！").strip()
     rules = store.rules(initialize=False)
+    filter_command = "过滤" in text or bool(re.search(r"\bfilter\b", text, re.I))
+
+    filter_text = re.sub(
+        r"^(?:新增|添加)\s*(?:Inbox|收件箱|邮件)?过滤规则[：:]?\s*", "", text, flags=re.I
+    )
+    filter_text = re.sub(r"^(?:过滤|屏蔽)", "", filter_text)
+    sender = re.fullmatch(r"(?:发件人|发信人)(?:为|是)\s*" + QUOTED + r"(?:的邮件)?", filter_text)
+    keyword = re.fullmatch(
+        r"(标题|正文|关键词)?(?:包含|含有)\s*" + QUOTED + r"(?:的邮件)?", filter_text
+    )
+    english = re.fullmatch(r"filter emails from\s+" + QUOTED, text, re.I)
+    if filter_text != text and (sender or keyword) or english:
+        if sender or english:
+            return MailRulePreview(
+                operation="add",
+                rule=MailRule(
+                    field="sender", contains=(sender or english)[1], match="equals", action="filter"
+                ),
+            )
+        return MailRulePreview(
+            operation="add",
+            rule=MailRule(
+                field={"标题": "subject", "正文": "body"}.get(keyword[1], "any"),
+                contains=keyword[2],
+                action="filter",
+            ),
+        )
 
     def target(value):
         matches = [
             rule
             for rule in rules
-            if value.casefold() in {rule["id"].casefold(), rule["contains"].casefold()}
+            if (not filter_command or rule["action"] == "filter")
+            and value.casefold() in {rule["id"].casefold(), rule["contains"].casefold()}
         ]
         return matches[0] if len(matches) == 1 else None
 
@@ -45,7 +73,7 @@ def requested_edit(message, store):
         ]
         return matches[0]["id"] if len(matches) == 1 else None
 
-    match = re.fullmatch(r"(启用|禁用|删除)(?:邮件)?规则\s*" + QUOTED, text)
+    match = re.fullmatch(r"(启用|禁用|删除)(?:邮件|收件箱|Inbox)?(?:过滤)?规则\s*" + QUOTED, text)
     if not match:
         match = re.fullmatch(r"(enable|disable|delete)\s+(?:mail\s+)?rule\s+" + QUOTED, text, re.I)
     if match:
@@ -64,7 +92,7 @@ def requested_edit(message, store):
         )
 
     match = re.fullmatch(
-        r"(?:把|将)?(?:邮件)?规则\s*"
+        r"(?:把|将)?(?:邮件|收件箱|Inbox)?(?:过滤)?规则\s*"
         + QUOTED
         + r"(?:的)?(关键词|匹配位置|关联课程|分类)(?:改为|改成|设为)\s*"
         + QUOTED,
@@ -157,7 +185,7 @@ class MailRuleTools:
     def __init__(self, service, message):
         self.store = MailStore(service.db)
         self.message = message
-        self.enabled = bool(re.search(r"mail|邮件|邮箱|规则|关键词", message, re.I))
+        self.enabled = bool(re.search(r"inbox|mail|邮件|邮箱|规则|关键词|过滤", message, re.I))
         try:
             self.intent = requested_edit(message, self.store) if self.enabled else None
         except ValueError:
@@ -230,6 +258,9 @@ class MailRuleTools:
                 ],
                 "edit_available": self.intent is not None,
                 "examples": [
+                    "过滤发件人为“sender@example.edu”的邮件",
+                    "过滤包含“newsletter”的邮件",
+                    "禁用过滤规则“newsletter”",
                     "把包含“Intro to Programming”的邮件关联到“Programming”",
                     "把邮件规则“survey”的关键词改成“course survey”",
                     "禁用邮件规则“survey”",

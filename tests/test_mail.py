@@ -146,7 +146,12 @@ def test_existing_custom_rules_are_preserved_when_defaults_are_first_seeded(tmp_
 
         conn.execute("INSERT INTO mail_rules VALUES (?, ?)", ("legacy", json.dumps(legacy)))
     rules = {r["id"]: r for r in store.rules()}
-    assert rules["legacy"] == legacy | {"id": "legacy", "enabled": True, "priority": False}
+    assert rules["legacy"] == legacy | {
+        "id": "legacy",
+        "enabled": True,
+        "priority": False,
+        "match": "contains",
+    }
     assert len(rules) == len(DEFAULT_MAIL_RULES) + 1
     store.upsert(message(subject="worksheet", body="", body_complete=True))
     assert store.get("one")["categories"] == ["Read"]

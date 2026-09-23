@@ -7,9 +7,11 @@ import type { Material, MaterialPage } from './chat-types';
 export function MaterialLibrary({
   courseId,
   initialCitation,
+  conversationId,
 }: {
   courseId: string;
   initialCitation: Citation | null;
+  conversationId?: string | null;
 }) {
   const [query, setQuery] = useState('');
   const [provider, setProvider] = useState('');
@@ -92,13 +94,17 @@ export function MaterialLibrary({
       if (generation.current === sequence) setMoreLoading(false);
     }
   };
-  const open = async (document: Material) => {
+  const open = async (document: Material, citation = false) => {
     const sequence = ++detailRequest.current;
     setDetail(document);
     setDetailLoading(true);
     setError('');
     try {
-      const result = await api<Material>(`/chat/library/${encodeURIComponent(document.id)}`);
+      const path =
+        citation && conversationId && document.kind === 'email'
+          ? `/chat/conversations/${encodeURIComponent(conversationId)}/citations/${encodeURIComponent(document.id)}`
+          : `/chat/library/${encodeURIComponent(document.id)}`;
+      const result = await api<Material>(path);
       if (detailRequest.current === sequence) setDetail(result);
     } catch (e) {
       if (detailRequest.current === sequence) setError((e as Error).message);
@@ -108,8 +114,11 @@ export function MaterialLibrary({
   };
   useEffect(() => {
     if (initialCitation)
-      void open({ ...initialCitation, body: '', course_id: initialCitation.course_id ?? null });
-  }, [initialCitation]);
+      void open(
+        { ...initialCitation, body: '', course_id: initialCitation.course_id ?? null },
+        true,
+      );
+  }, [initialCitation, conversationId]);
   return (
     <section className="material-library" aria-label="Course materials">
       <div className="material-search">

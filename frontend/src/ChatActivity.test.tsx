@@ -3,6 +3,76 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { expect, it } from 'vitest';
 import { Activity } from './ChatActivity';
 
+it('distinguishes saved memories from proposals that still need approval', () => {
+  const pending = renderToStaticMarkup(
+    <Activity
+      items={[
+        {
+          id: 'memory',
+          label: 'Remembering a preference',
+          status: 'done',
+          memory_change: { id: 'memory-1', text: 'Prefer examples', status: 'pending' },
+        },
+      ]}
+    />,
+  );
+  expect(pending).toContain('Needs confirmation in Memories');
+  expect(pending).toContain('Prefer examples');
+  expect(pending).not.toContain('Saved to memory');
+  expect(pending).not.toContain('class="warning"');
+  const active = renderToStaticMarkup(
+    <Activity
+      items={[
+        {
+          id: 'memory',
+          label: 'Remembering a preference',
+          status: 'done',
+          memory_change: { id: 'memory-1', text: 'Prefer examples', status: 'active' },
+        },
+      ]}
+    />,
+  );
+  expect(active).toContain('Saved to memory');
+  expect(active).not.toContain('Needs confirmation');
+});
+
+it('distinguishes Inbox previews from local changes and includes the affected email', () => {
+  const preview = renderToStaticMarkup(
+    <Activity
+      items={[
+        {
+          id: 'preview',
+          label: 'Previewing Inbox changes',
+          status: 'done',
+          inbox_preview: { action: 'delete', matched: 2, changed: 2 },
+        },
+      ]}
+    />,
+  );
+  expect(preview).toContain('2 matched');
+  expect(preview).not.toContain('Deleted locally');
+  const applied = renderToStaticMarkup(
+    <Activity
+      items={[
+        {
+          id: 'apply',
+          label: 'Updating local Inbox',
+          status: 'done',
+          inbox_change: {
+            action: 'unread',
+            matched: 1,
+            changed: 1,
+            has_more: false,
+            messages: [{ id: 'mail-1', subject: 'Survey' }],
+          },
+        },
+      ]}
+    />,
+  );
+  expect(applied).toContain('Marked unread locally');
+  expect(applied).toContain('Survey');
+});
+
 it('keeps visited sources and incomplete coverage visible in browser activity', () => {
   const html = renderToStaticMarkup(
     <Activity

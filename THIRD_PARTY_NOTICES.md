@@ -11,6 +11,11 @@ Its license is included with the separately installed package.
 [remark-gfm](https://github.com/remarkjs/remark-gfm) render chat Markdown and GFM tables.
 Both use the MIT license, included in their installed packages.
 
+Windows tray integration uses [pystray](https://github.com/moses-palmer/pystray)
+(LGPLv3) and [Pillow](https://github.com/python-pillow/Pillow) (MIT-CMU).
+These packages are installed separately with their license files; license names
+were checked against the installed package metadata.
+
 The Gradescope parser was developed with reference to student-page endpoint and markup
 observations in [nyuoss/gradescope-api](https://github.com/nyuoss/gradescope-api) at commit
 `586ad513b6b4715682f09fc6fe3fff2e73304f74`. Its actual `LICENSE.md` at that commit was read.

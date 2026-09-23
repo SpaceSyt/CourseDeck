@@ -1,7 +1,7 @@
 from datetime import timedelta
 
 from coursedeck.domain import now
-from coursedeck.knowledge import KnowledgeStore, material_freshness
+from coursedeck.knowledge import KnowledgeStore, material_freshness, search_terms
 
 
 def material(key, **values):
@@ -32,6 +32,28 @@ def test_title_phrase_word_boundaries_and_unicode_ranking(tmp_path):
     assert not store.search("lab")
     assert [d["id"] for d in store.search("微积分课程")] == ["chinese"]
     assert [d["id"] for d in store.search("期末考试")] == ["chinese"]
+
+
+def test_mixed_script_keywords_preserve_compound_words_and_chinese_bigrams(tmp_path):
+    terms = search_terms("我今天数学quiz考什么，看syllabus Calc-2 chain_rule")
+    assert "quiz" in terms and "syllabus" in terms
+    assert "quiz考什么" not in terms
+    assert terms["calc-2"] == 1 and terms["chain_rule"] == 1
+    assert terms["数学"] == 0.35 and terms["考什么"] == 1
+    store = KnowledgeStore(tmp_path / "knowledge.sqlite3")
+    store.upsert_documents(
+        [
+            material("quiz", title="Quiz 02", body="This week's quiz is differentiation."),
+            material("syllabus", title="Calculus syllabus", body="Course calendar"),
+            material("mixed", title="数学quiz", body="Exact mixed-script phrase"),
+            material("spaced", title="数学 quiz", body="Spaced phrase"),
+        ]
+    )
+    assert {item["id"] for item in store.search("我今天数学quiz考什么，看syllabus")} >= {
+        "quiz",
+        "syllabus",
+    }
+    assert [item["id"] for item in store.search('"数学quiz"')] == ["mixed"]
 
 
 def test_filters_scope_and_unknown_are_distinct_from_incomplete(tmp_path):

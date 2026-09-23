@@ -64,10 +64,17 @@ newest-first by default; priority filtering/sorting is an explicit view choice.
 Cached data is readable before startup sync finishes. Course providers share a serial queue
 with per-provider locks and timeouts. Startup, manual and periodic requests use the same queue;
 duplicate queued requests and overlapping whole-source rounds are coalesced. A periodic loop
-waits 30 minutes before its first round and after each finished round. Turning off startup sync
+waits 10 minutes before its first round and after each finished round. Turning off startup sync
 does not disable this loop. Gmail retains its separate five-minute poll. UI polls the local
 snapshot (simple, reconnect-friendly, no required SSE broker). Shutdown cancels queued work
 and the periodic loop before closing connector browsers.
+
+The CLI takes an OS-held lock on the selected data directory and reserves its loopback
+listening socket before loading the ASGI app. Duplicate launches cannot initialize the
+same databases or begin competing browser sessions, including on a different port.
+The default data location is anchored to the project root; an explicit `--data-dir`
+overrides `COURSEDECK_DATA_DIR`. The existing profile and credential namespace are retained.
+Shutdown and startup failures close all background owners before database readers.
 
 Transient network and rate-limit failures schedule at most two retries, after 15 and 60
 seconds, through the same queue. Manual requests replace pending retries; authentication

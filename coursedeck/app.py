@@ -1,7 +1,6 @@
 import asyncio
 import hashlib
 import json
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -12,6 +11,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .associations import AssociationStore
@@ -21,6 +21,7 @@ from .changes import summary as changes_summary
 from .chat import build_chat_router
 from .connectors.registry import build_connectors
 from .db import Database
+from .desktop import build_desktop_router
 from .domain import Settings, now
 from .gmail_browser import GmailBrowser
 from .knowledge import KnowledgeStore
@@ -37,6 +38,7 @@ from .maintenance import MaintenanceGate
 from .materials import MaterialCollector
 from .recovery import RecoveryManager, build_recovery_router
 from .revisions import DatabaseRevision
+from .runtime import data_directory
 from .sync import SyncEngine
 from .task_edits import TaskEdits
 from .task_history import build_task_history_router
@@ -88,7 +90,7 @@ class CourseBinding(BaseModel):
 
 
 def create_app(data_dir: Path | None = None) -> FastAPI:
-    data_dir = data_dir or Path(os.environ.get("COURSEDECK_DATA_DIR", "data")).resolve()
+    data_dir = data_directory(data_dir)
     db = Database(data_dir / "coursedeck.sqlite3")
     engine = SyncEngine(db, build_connectors(db, data_dir))
     knowledge = KnowledgeStore(data_dir / "knowledge.sqlite3")
@@ -152,16 +154,22 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app):
-        background["started"] = True
-        start_background()
-        if db.settings().startup_sync and not recovery.journal.exists():
-            engine.spawn(engine.sync_all(automatic=True))
-            gmail.spawn()
-        yield
-        background["started"] = False
-        await stop_mail()
-        await engine.close()
-        close_readers()
+        try:
+            background["started"] = True
+            start_background()
+            if db.settings().startup_sync and not recovery.journal.exists():
+                engine.spawn(engine.sync_all(automatic=True))
+                gmail.spawn()
+            yield
+        finally:
+            background["started"] = False
+            try:
+                await stop_mail()
+            finally:
+                try:
+                    await engine.close()
+                finally:
+                    close_readers()
 
     app = FastAPI(title="CourseDeck", lifespan=lifespan)
     app.state.db, app.state.engine = db, engine
@@ -179,6 +187,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             data_dir,
             material_fetch=materials.fetch,
             knowledge_store=knowledge,
+            gmail=gmail,
         )
     )
     app.include_router(build_changes_router(db))
@@ -186,6 +195,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     app.include_router(build_associations_router(associations))
     app.include_router(build_mail_rules_router(db))
     app.include_router(build_recovery_router(recovery, maintenance))
+    app.include_router(build_desktop_router(data_dir))
 
     @app.exception_handler(ValueError)
     async def invalid_config(request, exc):
@@ -398,9 +408,10 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         attention_only: bool = False,
         order: Literal["newest", "attention"] = "newest",
     ):
-        return mail.list(
-            deleted, ignored, offset, limit, attention_only=attention_only, order=order
-        ) | {"connection": gmail.status()}
+        value = await run_in_threadpool(
+            mail.list, deleted, ignored, offset, limit, attention_only=attention_only, order=order
+        )
+        return value | {"connection": gmail.status()}
 
     @app.get("/api/mail/rules")
     async def mail_rules():

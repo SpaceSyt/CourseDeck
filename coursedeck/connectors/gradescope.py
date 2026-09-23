@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 from playwright.async_api import Error as BrowserError
 
 from ..domain import Course, Outcome, SyncResult, Task, TaskScope
+from ..session_resume import login_prompt_visible, resume_session
 from .browser_base import BrowserConnector, is_login, session_html
 from .dates import source_date
 from .http import TransportError
@@ -177,6 +178,24 @@ class GradescopeConnector(BrowserConnector):
                 await page.goto(
                     self.base_url + "/account", wait_until="domcontentloaded", timeout=45000
                 )
+                origin = urlparse(self.base_url)
+
+                def at_account(candidate):
+                    parsed = urlparse(candidate)
+                    return (
+                        parsed.scheme == "https"
+                        and parsed.netloc == origin.netloc
+                        and parsed.path.rstrip("/") == "/account"
+                    )
+
+                if not await resume_session(page, at_account):
+                    needs_login = await login_prompt_visible(page) or is_login(await page.content())
+                    raise TransportError(
+                        Outcome.AUTH_REQUIRED if needs_login else Outcome.NETWORK_ERROR,
+                        "Gradescope requires login. Reconnect."
+                        if needs_login
+                        else "Gradescope sign-in redirect did not finish. Retry sync.",
+                    )
                 await page.locator('a[href*="/courses/"], input[type="password"]').first.wait_for(
                     state="attached", timeout=25000
                 )

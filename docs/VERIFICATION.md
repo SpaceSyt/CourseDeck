@@ -1,5 +1,42 @@
 # Verification record
 
+## Dedicated-browser source audit · 2026-09-23
+
+All five coursework sources and Gmail were checked in their dedicated visible
+browsers using saved sessions. This records one account's observed coverage,
+not a guarantee that every course or platform feature is supported.
+
+| Source | Observed result | Remaining limits |
+| --- | --- | --- |
+| Classroom | 1 current course; empty archived list checked; all 6 assignments among 12 Classwork items read, including explicit no-deadline and submission states | Scoring fields absent from the page; some linked attachment contents not included |
+| Gradescope | 2 courses, 8 visible assignment rows, 7 rows with stable task identities | One closed row has no ID anywhere in the page; its matching cached task is retained with unconfirmed freshness, without inventing an identity |
+| WebAssign | All 10 assignments: 6 current and 4 past; 4 submitted, 5 open, 1 unknown | The unknown item is Practice with no available score; it is retained without opening a practice attempt or inferring completion |
+| Brightspace | 8 enrolled courses, 66 tasks and 31 checked task-list scopes; all 5 visible homepage Work To Do entries matched once | Career-course discussions return 403 in the actual UI; two engineering material links are marked broken by the platform; some states and scoring fields remain unknown |
+| Rephactor | 1 current course, no inactive courses; all 13 published assignment IDs exactly matched expanded Pending/Past lists | Pending/Past is date-based, not completion evidence; personal completion remains unknown |
+| Gmail | Saved account recovered through Google's identity-confirmation Next page; latest Inbox page and history page 19 read, 100 headers out of a displayed 1,038 conversations | History continues incrementally; one cached body remains pending; this run did not compare every Inbox page or read attachments |
+
+WebAssign's homepage now exposes both Current and Past buttons. The reader selects
+Current explicitly, then All; a browser regression covers both buttons and both
+lists. Google's input-free `confirmidentifier` step now resumes only the displayed
+account, checking the linked mailbox identity. Wrong-account and real challenge
+pages remain blocked. Both fixes were verified against the actual source pages.
+
+The material audit read 13 Classroom documents (7 announcements and 6 materials)
+and collected 324 Brightspace documents (301 materials and 23 announcements).
+205 Brightspace documents had complete bodies; the remainder includes external
+targets, textless PDFs, broken links and 89 bodies deferred by the read budget.
+Coverage warnings remain visible after the verified snapshots are applied.
+
+All previously cached task IDs, local task notes and mail flags were preserved;
+104 source tasks remain in the database. SQLite integrity and foreign-key checks
+passed. Authentication state, private snapshots and browser screenshots stay under
+the ignored data directory.
+
+Publication validation: 871 backend tests, 36 frontend tests and all eight CI
+browser smoke suites passed. After the two live-page fixes, the 59 session-related
+and 52 WebAssign-related regression tests passed. Frontend production build,
+formatting, Ruff and generated task contracts also passed.
+
 ## Gmail pagination and cache integrity · 2026-09-12
 
 This supersedes the older latest-30-thread limit recorded below. The dedicated

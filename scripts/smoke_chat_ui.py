@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -114,6 +115,16 @@ async def check_ui(base_url):
                     for item in conversations.values()
                 ]
             }
+        elif "/citations/" in path:
+            assert path.endswith("mail:fixture"), path
+            result = document | {
+                "id": "mail:fixture",
+                "kind": "email",
+                "provider": "gmail",
+                "title": "Email fixture",
+                "body": "Verified email body from the conversation source.",
+                "body_truncated": False,
+            }
         elif path.startswith("/api/chat/conversations/"):
             result = conversations[path.rsplit("/", 1)[1]]
         elif path == "/api/chat/messages/stream":
@@ -157,6 +168,14 @@ async def check_ui(base_url):
                     "[[unknown-reference]] <script>unsafe()</script>",
                     "citations": [
                         document,
+                        document
+                        | {
+                            "id": "mail:fixture",
+                            "title": "Email fixture",
+                            "kind": "email",
+                            "provider": "gmail",
+                            "url": None,
+                        },
                         document
                         | {"id": "unsafe", "title": "Unsafe URL", "url": "javascript:alert(1)"},
                     ],
@@ -225,7 +244,7 @@ async def check_ui(base_url):
         assert history["x"] + history["width"] <= chat_main["x"] + 1
         composer = page.locator("form.chat-composer")
         send_button = composer.get_by_role("button", name="Send", exact=True)
-        find_materials = composer.get_by_role("button", name="Find materials", exact=True)
+        find_materials = composer.get_by_role("button", name="Refresh materials", exact=True)
         await expect(send_button).to_be_disabled()
         await expect(composer.get_by_label("Message", exact=True)).to_have_count(1)
         await expect(find_materials).to_have_attribute("aria-pressed", "false")
@@ -302,6 +321,9 @@ async def check_ui(base_url):
         await expect(page.locator(".chat-markdown table tbody tr")).to_have_count(1)
         await expect(page.locator(".chat-markdown td strong")).to_have_text("Loop homework")
         await expect(page.locator(".chat-markdown pre code")).to_contain_text("print(i)")
+        await page.get_by_role("button", name="[2] Email fixture", exact=True).click()
+        await expect(page.locator(".material-body")).to_contain_text("Verified email body")
+        await page.get_by_role("button", name="Conversation", exact=True).click()
         await page.locator(".chat-inline-citation").click()
         await expect(page.locator(".material-body")).to_contain_text("All lecture sections")
         await page.get_by_role("button", name="Conversation", exact=True).click()
@@ -385,7 +407,10 @@ async def check_ui(base_url):
 
 
 def main():
-    handler = partial(QuietHandler, directory=str(Path("frontend/dist").resolve()))
+    handler = partial(
+        QuietHandler,
+        directory=str(Path(os.environ.get("COURSEDECK_UI_DIST", "frontend/dist")).resolve()),
+    )
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

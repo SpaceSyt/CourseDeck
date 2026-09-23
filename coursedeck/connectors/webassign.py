@@ -12,6 +12,7 @@ from playwright.async_api import Error as BrowserError
 
 from ..credentials import CredentialStore
 from ..domain import Course, Outcome, SyncResult, Task, TaskScope
+from ..session_resume import login_prompt_visible, resume_session
 from .browser_base import BrowserConnector, is_login
 from .dates import source_date
 from .http import TransportError
@@ -528,6 +529,21 @@ class WebAssignConnector(BrowserConnector):
                 page.on("response", observe)
                 urls = list(dict.fromkeys(urls))
                 for url in urls:
+                    target = urlparse(url)
+
+                    def at_assignment_list(candidate, target=target):
+                        parsed = urlparse(candidate)
+                        query = parse_qs(parsed.query)
+                        return (parsed.scheme, parsed.netloc, parsed.path) == (
+                            "https",
+                            target.netloc,
+                            target.path,
+                        ) and all(
+                            query.get(key) == value
+                            for key, value in parse_qs(target.query).items()
+                            if key in PUBLIC_QUERY_KEYS
+                        )
+
                     response = await page.goto(
                         self.session_url(url), wait_until="domcontentloaded", timeout=45000
                     )
@@ -535,17 +551,35 @@ class WebAssignConnector(BrowserConnector):
                         raise TransportError(
                             Outcome.RATE_LIMITED, "WebAssign rate limited this request."
                         )
-                    try:
-                        safe_page_url(page.url)
-                    except ValueError as exc:
+                    if not await resume_session(page, at_assignment_list):
+                        landed = urlparse(page.url)
+                        if (landed.scheme, landed.netloc, landed.path) == (
+                            target.scheme,
+                            target.netloc,
+                            target.path,
+                        ):
+                            raise TransportError(
+                                Outcome.PARSE_ERROR,
+                                "WebAssign returned a different course; "
+                                "cached assignments retained.",
+                            )
+                        needs_login = await login_prompt_visible(page) or is_login(
+                            await page.content()
+                        )
                         raise TransportError(
-                            Outcome.AUTH_REQUIRED, "WebAssign redirected to login. Reconnect."
-                        ) from exc
+                            Outcome.AUTH_REQUIRED if needs_login else Outcome.NETWORK_ERROR,
+                            "WebAssign redirected to login. Reconnect."
+                            if needs_login
+                            else "WebAssign sign-in redirect did not finish. Retry sync.",
+                        )
                     await wait_for_assignment_list(
                         page,
                         "#js-student-myAssignmentsWrapper button, "
                         "#js-student-myAssignmentsPage [role='tab']",
                     )
+                    # An SSO return can rotate UserPass while retaining the same course URL.
+                    if parse_qs(urlparse(page.url).query).get("UserPass"):
+                        await self.validate_session(context)
                     # Discover additional courses when the account exposes course links.
                     for href in await page.locator('a[href*="course="]').evaluate_all(
                         "elements => elements.map(element => element.href)"
@@ -558,7 +592,9 @@ class WebAssignConnector(BrowserConnector):
                         if query.get("action") == ["home/index"] and candidate not in urls:
                             if len(urls) < 100:
                                 urls.append(candidate)
-                    home_button = page.locator("#js-student-myAssignmentsWrapper button")
+                    home_button = page.locator("#js-student-myAssignmentsWrapper").get_by_role(
+                        "button", name=re.compile(r"^(?:Show )?Current Assignments(?:\s*\(\d+\))?$")
+                    )
                     if await home_button.count():
                         await home_button.click()
                         await wait_for_assignment_list(
@@ -621,7 +657,11 @@ class WebAssignConnector(BrowserConnector):
                             pass
                         finally:
                             await detail.close()
-                self.vault.set("webassign_session", session | {"cookies": await context.cookies()})
+                self.vault.set(
+                    "webassign_session",
+                    (self.vault.get("webassign_session") or session)
+                    | {"cookies": await context.cookies()},
+                )
                 result.metadata["network_response_shapes"] = [
                     list(item) for item in sorted(network_shapes)
                 ]

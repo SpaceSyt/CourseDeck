@@ -38,19 +38,27 @@ export function MailRules({
   close,
   changed,
   email,
+  mode = 'rules',
 }: {
   courses: Course[];
   close: () => void;
   changed: () => void;
   email?: MailMessage | null;
+  mode?: 'rules' | 'filters';
 }) {
+  const filters = mode === 'filters';
   const ref = useRef<HTMLDialogElement>(null);
   const [rules, setRules] = useState<MailRule[]>([]);
-  const [field, setField] = useState<MailRule['field']>(email?.sender_email ? 'sender' : 'subject');
+  const [field, setField] = useState<MailRule['field']>(
+    email?.sender_email ? 'sender' : filters ? 'any' : 'subject',
+  );
+  const [match, setMatch] = useState<'contains' | 'equals'>(
+    filters && email?.sender_email ? 'equals' : 'contains',
+  );
   const [contains, setContains] = useState(
     (email?.sender_email || email?.subject || '').slice(0, 200),
   );
-  const [action, setAction] = useState<MailRule['action']>('course');
+  const [action, setAction] = useState<MailRule['action']>(filters ? 'filter' : 'course');
   const [value, setValue] = useState(email?.course_id || '');
   const [editing, setEditing] = useState<string | null>(null);
   const [enabled, setEnabled] = useState(true);
@@ -76,6 +84,7 @@ export function MailRules({
     invalidate();
     setEditing(rule.id);
     setField(rule.field);
+    setMatch(rule.match ?? 'contains');
     setContains(rule.contains);
     setAction(rule.action);
     const course = courses.find((c) => c.id === rule.value || c.workspace_id === rule.value);
@@ -159,69 +168,76 @@ export function MailRules({
   return (
     <dialog ref={ref} className="course-dialog mail-rules" onCancel={close}>
       <div className="dialog-heading">
-        <h2>Mail rules</h2>
-        <button aria-label="Close mail rules" onClick={close}>
+        <h2>{filters ? 'Inbox filters' : 'Mail rules'}</h2>
+        <button aria-label={filters ? 'Close Inbox filters' : 'Close mail rules'} onClick={close}>
           <X size={18} />
         </button>
       </div>
       <div className="rule-list">
-        {rules.map((rule) => (
-          <div key={rule.id} className={editing === rule.id ? 'rule-editing' : ''}>
-            <input
-              type="checkbox"
-              aria-label={`Enable rule ${rule.contains}`}
-              checked={rule.enabled}
-              disabled={busy}
-              onChange={() => {
-                const { id, ...payload } = rule;
-                edit(rule);
-                setEnabled(!rule.enabled);
-                void preview({
-                  operation: 'update',
-                  id,
-                  rule: { ...payload, enabled: !rule.enabled },
-                });
-              }}
-            />
-            <span>
-              <b>{rule.contains}</b>
-              <small>
-                {rule.field} →{' '}
-                {rule.action === 'course'
-                  ? (courses.find((c) => c.id === rule.value || c.workspace_id === rule.value)
-                      ?.name ?? 'Missing course')
-                  : rule.action === 'category'
-                    ? rule.value
-                    : rule.action === 'none'
-                      ? 'No category'
-                      : 'Auto-ignore'}
-                {rule.priority ? ' · Priority' : ''}
-              </small>
-            </span>
-            <button
-              disabled={busy}
-              aria-label={`Edit rule ${rule.contains}`}
-              onClick={() => edit(rule)}
-            >
-              <Pencil size={15} />
-            </button>
-            <button
-              disabled={busy}
-              aria-label={`Delete rule ${rule.contains}`}
-              onClick={() => void preview({ operation: 'delete', id: rule.id })}
-            >
-              <Trash2 size={15} />
-            </button>
-          </div>
-        ))}
+        {rules
+          .filter((rule) => filters === (rule.action === 'filter'))
+          .map((rule) => (
+            <div key={rule.id} className={editing === rule.id ? 'rule-editing' : ''}>
+              <input
+                type="checkbox"
+                aria-label={`Enable rule ${rule.contains}`}
+                checked={rule.enabled}
+                disabled={busy}
+                onChange={() => {
+                  const { id, ...payload } = rule;
+                  edit(rule);
+                  setEnabled(!rule.enabled);
+                  void preview({
+                    operation: 'update',
+                    id,
+                    rule: { ...payload, enabled: !rule.enabled },
+                  });
+                }}
+              />
+              <span>
+                <b>{rule.contains}</b>
+                <small>
+                  {rule.field}
+                  {rule.match === 'equals' ? ' equals' : ' contains'} →{' '}
+                  {rule.action === 'course'
+                    ? (courses.find((c) => c.id === rule.value || c.workspace_id === rule.value)
+                        ?.name ?? 'Missing course')
+                    : rule.action === 'category'
+                      ? rule.value
+                      : rule.action === 'none'
+                        ? 'No category'
+                        : rule.action === 'filter'
+                          ? 'Exclude from Inbox'
+                          : 'Auto-ignore'}
+                  {rule.priority ? ' · Priority' : ''}
+                </small>
+              </span>
+              <button
+                disabled={busy}
+                aria-label={`Edit rule ${rule.contains}`}
+                onClick={() => edit(rule)}
+              >
+                <Pencil size={15} />
+              </button>
+              <button
+                disabled={busy}
+                aria-label={`Delete rule ${rule.contains}`}
+                onClick={() => void preview({ operation: 'delete', id: rule.id })}
+              >
+                <Trash2 size={15} />
+              </button>
+            </div>
+          ))}
       </div>
-      <button
-        className="restore-mail-rules"
-        disabled={busy}
-        onClick={() => void preview({ operation: 'reset-defaults' })}
-      >
-        Restore default keywords
-      </button>
+      {!filters && (
+        <button
+          className="restore-mail-rules"
+          disabled={busy}
+          onClick={() => void preview({ operation: 'reset-defaults' })}
+        >
+          Restore default keywords
+        </button>
+      )}
       {review && (
         <section className="rule-preview" aria-label="Rule impact">
           <h3>
@@ -297,7 +313,7 @@ export function MailRules({
           void preview({
             operation: editing ? 'update' : 'add',
             ...(editing ? { id: editing } : {}),
-            rule: { field, contains, action, value, enabled, priority },
+            rule: { field, contains, match, action, value, enabled, priority },
           });
         }}
       >
@@ -310,6 +326,7 @@ export function MailRules({
             onChange={(e) => {
               const next = e.target.value as MailRule['field'];
               setField(next);
+              if (filters) setMatch(next === 'sender' ? 'equals' : 'contains');
               if (email && !editing && (next === 'sender' || next === 'subject'))
                 setContains(
                   (next === 'sender' ? email.sender_email || email.sender : email.subject).slice(
@@ -325,8 +342,22 @@ export function MailRules({
             <option value="any">Anywhere</option>
           </select>
         </label>
+        {filters && (
+          <label>
+            Match
+            <select
+              aria-label="Match"
+              value={match}
+              disabled={busy}
+              onChange={(e) => setMatch(e.target.value as 'contains' | 'equals')}
+            >
+              <option value="contains">Contains</option>
+              <option value="equals">Equals</option>
+            </select>
+          </label>
+        )}
         <label>
-          Contains
+          {filters ? (match === 'equals' ? 'Equals' : 'Contains') : 'Contains'}
           <input
             required
             minLength={2}
@@ -336,23 +367,25 @@ export function MailRules({
             onChange={(e) => setContains(e.target.value)}
           />
         </label>
-        <label>
-          Apply
-          <select
-            aria-label="Apply"
-            value={action}
-            disabled={busy}
-            onChange={(e) => {
-              setAction(e.target.value as MailRule['action']);
-              setValue('');
-            }}
-          >
-            <option value="course">Course</option>
-            <option value="category">Category</option>
-            <option value="none">No category</option>
-            <option value="ignore">Auto-ignore</option>
-          </select>
-        </label>
+        {!filters && (
+          <label>
+            Apply
+            <select
+              aria-label="Apply"
+              value={action}
+              disabled={busy}
+              onChange={(e) => {
+                setAction(e.target.value as MailRule['action']);
+                setValue('');
+              }}
+            >
+              <option value="course">Course</option>
+              <option value="category">Category</option>
+              <option value="none">No category</option>
+              <option value="ignore">Auto-ignore</option>
+            </select>
+          </label>
+        )}
         {action === 'course' && (
           <label>
             Course
@@ -384,15 +417,17 @@ export function MailRules({
             />
           </label>
         )}
-        <label className="rule-priority">
-          <input
-            type="checkbox"
-            checked={priority}
-            disabled={busy}
-            onChange={(e) => setPriority(e.target.checked)}
-          />
-          Mark as priority
-        </label>
+        {!filters && (
+          <label className="rule-priority">
+            <input
+              type="checkbox"
+              checked={priority}
+              disabled={busy}
+              onChange={(e) => setPriority(e.target.checked)}
+            />
+            Mark as priority
+          </label>
+        )}
         {error && (
           <p className="warning" role="alert">
             {error}

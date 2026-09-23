@@ -89,6 +89,17 @@ async def check(base_url, app):
         await inbox.get_by_role(
             "button", name="Open email: Weekly course update", exact=True
         ).click()
+        # Chat changes must refresh the open detail via GET, preserving unread overrides.
+        store.patch("normal", {"read": False, "deleted": True})
+        await page.evaluate("window.dispatchEvent(new Event('coursedeck:inbox-changed'))")
+        await expect(inbox.get_by_role("button", name="Restore email", exact=True)).to_be_visible()
+        assert store.get("normal")["unread"]
+        store.patch("normal", {"deleted": False})
+        await page.evaluate("window.dispatchEvent(new Event('coursedeck:inbox-changed'))")
+        await expect(
+            inbox.get_by_role("button", name="Delete email locally", exact=True)
+        ).to_be_visible()
+        assert store.get("normal")["unread"]
         await inbox.get_by_role("button", name="Create rule", exact=True).click()
         dialog = page.locator("dialog.mail-rules")
         await expect(dialog.get_by_label("Contains", exact=True)).to_have_value(
@@ -143,6 +154,42 @@ async def check(base_url, app):
         assert len(writes) == 2
         await review.get_by_role("button", name="Cancel", exact=True).click()
         assert len(writes) == 2
+        await dialog.get_by_role("button", name="Done", exact=True).click()
+        await inbox.get_by_role("button", name="Back to inbox", exact=True).click()
+        store.upsert(
+            MailMessage(
+                id="filtered",
+                sender="Bulk sender",
+                sender_email="bulk@example.test",
+                subject="Filtered fixture",
+            )
+        )
+        await inbox.get_by_label("Inbox menu", exact=True).click()
+        await inbox.get_by_label("Show auto-ignored", exact=True).uncheck()
+        await inbox.get_by_role("button", name="Inbox filters", exact=True).click()
+        await expect(
+            dialog.get_by_role("heading", name="Inbox filters", exact=True)
+        ).to_be_visible()
+        await expect(dialog.get_by_label("Apply", exact=True)).to_have_count(0)
+        await dialog.get_by_label("Match in", exact=True).select_option("sender")
+        await expect(dialog.get_by_label("Match", exact=True)).to_have_value("equals")
+        await dialog.get_by_label("Equals", exact=True).fill("bulk@example.test")
+        await dialog.get_by_role("button", name="Preview changes", exact=True).click()
+        await expect(review).to_contain_text("1 newly ignored")
+        assert not store.get("filtered")["ignored"]
+        await review.get_by_role("button", name="Apply changes", exact=True).click()
+        assert store.get("filtered")["ignored"]
+        assert store.get("filtered")["classification"] == "unclassifiable"
+        await dialog.get_by_role("button", name="Done", exact=True).click()
+        await expect(
+            inbox.get_by_role("button", name="Open email: Filtered fixture", exact=True)
+        ).to_have_count(0)
+        await inbox.get_by_label("Inbox menu", exact=True).click()
+        await inbox.get_by_label("Show auto-ignored", exact=True).check()
+        await inbox.get_by_label("Inbox menu", exact=True).click()
+        await inbox.get_by_role("button", name="Open email: Filtered fixture", exact=True).click()
+        await inbox.get_by_role("button", name="Auto-ignored · Restore", exact=True).click()
+        assert not store.get("filtered")["ignored"]
         await page.set_viewport_size({"width": 390, "height": 844})
         assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         assert not errors, errors

@@ -22,7 +22,10 @@ def normalized_text(value):
 
 
 def search_terms(query):
-    words = re.findall(r"[\u3400-\u9fff]+|[^\W_]+(?:[-_][^\W_]+)*", normalized_text(query))
+    words = re.findall(
+        r"[\u3400-\u9fff]+|[^\W_\u3400-\u9fff]+(?:[-_][^\W_\u3400-\u9fff]+)*",
+        normalized_text(query),
+    )
     terms = {}
     for word in words[:32]:
         terms[word] = 1.0
@@ -336,6 +339,19 @@ class KnowledgeStore:
     def search(self, query: str, course_ids: list[str] | None = None, limit=8, **filters):
         return self._ranked_documents(query, course_ids, **filters)[: max(1, min(limit, 20))]
 
+    def search_page(self, query, course_ids, offset=0, limit=8):
+        documents = [
+            document
+            for document in self._ranked_documents(query, course_ids)
+            if document["kind"] not in {"mail", "email"} and document["provider"] != "gmail"
+        ]
+        return {
+            "documents": documents[offset : offset + limit],
+            "total": len(documents),
+            "offset": offset,
+            "has_more": offset + limit < len(documents),
+        }
+
     def _ranked_documents(
         self, query, course_ids, *, provider=None, kind=None, freshness="all", completeness="all"
     ):
@@ -446,6 +462,11 @@ class KnowledgeStore:
             return (
                 db.execute("UPDATE conversations SET title=? WHERE id=?", (title, key)).rowcount > 0
             )
+
+    def delete_conversation(self, key: str):
+        with self.connection() as db:
+            db.execute("DELETE FROM messages WHERE conversation_id=?", (key,))
+            return db.execute("DELETE FROM conversations WHERE id=?", (key,)).rowcount > 0
 
     def conversation(self, key: str):
         with self.connection() as db:

@@ -33,6 +33,12 @@ COURSE = {
         TASK,
         "https://school.example/d2l/le/content/123/Home",
         "https://school.example/d2l/lms/quizzing/user/quiz_summary.d2l?qi=7&ou=123",
+        "https://school.example/d2l/le/lessons/123",
+        "https://school.example/d2l/le/lessons/123/topics/456",
+        "https://school.example/d2l/le/lessons/123/units/456",
+        "https://school.example/d2l/lms/news/main.d2l?ou=123",
+        "https://school.example/d2l/lms/dropbox/dropbox.d2l?ou=123",
+        "https://school.example/d2l/lms/quizzing/quizzing.d2l?ou=123",
     ],
 )
 def test_navigation_accepts_reading_pages(url):
@@ -50,6 +56,10 @@ def test_navigation_accepts_reading_pages(url):
         "https://school.example/d2l/le/content/123/%2e%2e/999",
         "https://school.example.evil.test/d2l/home/123",
         "https://user:secret@school.example/d2l/home/123",
+        "https://school.example/d2l/le/lessons/999/topics/456?ou=123",
+        "https://school.example/d2l/le/lessons/123/topics/456/edit",
+        "https://school.example/d2l/lms/news/main.d2l?ou=999",
+        "https://school.example/d2l/lms/dropbox/dropbox.d2l",
     ],
 )
 def test_navigation_rejects_unsafe_pages(url):
@@ -126,7 +136,9 @@ async def case(tmp_path, monkeypatch):
             async def serve(route):
                 received.append((route.request.method, route.request.url))
                 await route.fulfill(
-                    status=content["status"], content_type="text/html", body=content["html"]
+                    status=content["status"],
+                    content_type="text/html; charset=utf-8",
+                    body=content["html"],
                 )
 
             await context.route("**/*", serve)
@@ -225,6 +237,148 @@ async def test_scope_and_login_failure_never_open_interactive_browser(case):
     assert case.manager.interactive is None and not case.service.engine.queue_lock.locked()
 
 
+async def test_brightspace_restores_fixed_session_before_restricting_course_navigation(case):
+    restored = []
+
+    async def restore(context):
+        assert case.service.engine.queue_lock.locked()
+        assert case.service.engine.locks["brightspace"].locked()
+        page = await context.new_page()
+        await page.goto("https://school.example/d2l/home")
+        await page.evaluate("sessionStorage.setItem('fixture-sign-in', 'restored')")
+        await page.evaluate("fetch('/d2l/lp/auth/login/samlLogin.d2l', {method:'POST'})")
+        restored.append(page)
+
+    case.service.engine.connectors["brightspace"].restore_browser_session = restore
+    result = await case.tools.run("browser_open", {"source_course_id": "brightspace:123"})
+    assert len(restored) == 1 and case.tools.page is restored[0]
+    assert await case.tools.page.evaluate("sessionStorage.getItem('fixture-sign-in')") == "restored"
+    assert result["browser_visit"]["url"] == ROOT
+    assert ("POST", "https://school.example/d2l/lp/auth/login/samlLogin.d2l") in case.received
+    before = len(case.received)
+    target = next(t for t in result["targets"] if t["label"] == "Next page")
+    followed = await case.tools.run(
+        "browser_follow",
+        {
+            "snapshot_id": result["snapshot_id"],
+            "target_id": target["target_id"],
+        },
+    )
+    assert all(method == "GET" for method, _ in case.received[before:])
+    assert any("dynamic requests" in warning for warning in followed["browser_visit"]["warnings"])
+    with pytest.raises(ValueError, match="outside"):
+        await case.tools.run("browser_open", {"source_course_id": "brightspace:999"})
+    assert len(restored) == 1
+
+
+async def test_brightspace_session_restore_failure_is_clear_and_releases_profile(case):
+    async def restore(context):
+        await context.new_page()
+        raise ValueError("https://idp.example/login?token=fixture-secret")
+
+    case.service.engine.connectors["brightspace"].restore_browser_session = restore
+    with pytest.raises(ValueError, match="sign-in could not be restored") as error:
+        await case.tools.run("browser_open", {"source_course_id": "brightspace:123"})
+    assert "fixture-secret" not in str(error.value)
+    assert not case.received and not case.contexts[-1].pages
+    assert not case.service.engine.queue_lock.locked()
+
+
+async def test_blocked_signin_redirect_is_not_reported_as_another_course(case):
+    async def navigate(_):
+        await case.tools.page.goto("https://school.example/d2l/login")
+
+    case.tools.navigate = navigate
+    with pytest.raises(ValueError, match="redirected to sign-in"):
+        await case.tools.run("browser_open", {"source_course_id": "brightspace:123"})
+    assert not case.service.engine.queue_lock.locked()
+    with pytest.raises(ValueError, match="outside"):
+        await case.tools.run("browser_open", {"source_course_id": "brightspace:999"})
+
+
+async def test_embedded_signin_failure_keeps_readable_course_evidence(case):
+    case.content["html"] += '<iframe src="https://school.example/d2l/login"></iframe>'
+    result = await case.tools.run("browser_open", {"source_course_id": "brightspace:123"})
+    assert "Write a proof" in result["documents"][0]["body"]
+    assert any("embedded frame" in warning for warning in result["browser_visit"]["warnings"])
+
+
+@pytest.mark.parametrize("metadata_change", [{}, {"Id": 999}, {"IsHidden": True}])
+async def test_cached_brightspace_topic_reads_confirmed_static_attachment(
+    case, monkeypatch, metadata_change
+):
+    document = {
+        "id": "material:syllabus",
+        "provider": "brightspace",
+        "course_id": "brightspace:123",
+        "title": "Syllabus",
+        "body": "Cached excerpt",
+        "url": (
+            "https://school.example/d2l/le/content/123/Home"
+            "?itemIdentifier=D2L.LE.Content.ContentObject.TopicCO-456"
+        ),
+    }
+    case.service.store.upsert_documents([document])
+    case.tools.documents[document["id"]] = document
+    calls = []
+
+    async def restore(context):
+        page = await context.new_page()
+        await page.goto("https://school.example/d2l/home")
+
+        async def metadata():
+            return {
+                "Id": 456,
+                "Type": 1,
+                "IsHidden": False,
+                "IsLocked": False,
+                "Title": "Current syllabus",
+                "Url": "/content/enforced/123-course/syllabus.pdf",
+                **metadata_change,
+            }
+
+        async def get(url, **kwargs):
+            calls.append(url)
+            assert kwargs["max_redirects"] == 0
+            return SimpleNamespace(status=200, json=metadata)
+
+        monkeypatch.setattr(context.request, "get", get)
+
+    async def read(task, link):
+        assert not case.service.engine.queue_lock.locked() and not case.contexts[-1].pages
+        assert link["url"] == "https://school.example/content/enforced/123-course/syllabus.pdf"
+        return document | {
+            "id": "link:current",
+            "url": link["url"],
+            "title": link["title"],
+            "body": "Weekly quizzes cover the prior week",
+            "complete": True,
+            "checked_at": now().isoformat(),
+            "warnings": [],
+        }
+
+    case.service.engine.connectors["brightspace"].restore_browser_session = restore
+    case.service.link_reader = SimpleNamespace(read=read)
+    if metadata_change:
+        with pytest.raises(ValueError, match="identity or visibility"):
+            await case.tools.run("browser_open", {"document_id": document["id"]})
+        assert not case.service.engine.queue_lock.locked()
+    else:
+        result = await case.tools.run("browser_open", {"document_id": document["id"]})
+        assert result["documents"][0]["body"] == "Weekly quizzes cover the prior week"
+        assert result["documents"][0]["title"] == "Current syllabus"
+        assert not result["targets"]
+    assert calls == ["https://school.example/d2l/api/le/1.82/123/content/topics/456"]
+    assert case.service.store.get(document["id"])["body"] == "Cached excerpt"
+
+
+async def test_loading_page_shell_is_explicitly_incomplete(case):
+    case.content["html"] = "<title>Loading... - Calculus</title><h1>Calculus</h1>"
+    result = await case.tools.run("browser_open", {"source_course_id": "brightspace:123"})
+    assert any("page shell" in warning for warning in result["browser_visit"]["warnings"])
+    assert result["documents"][0]["complete"] is False
+
+
 async def test_cancel_while_queued_releases_only_owned_locks(case):
     await case.service.engine.queue_lock.acquire()
     job = asyncio.create_task(
@@ -293,6 +447,120 @@ async def test_attachment_releases_profile_before_existing_reader(case):
         "browser_follow", {"snapshot_id": opened["snapshot_id"], "target_id": target["target_id"]}
     )
     assert result["documents"][0]["body"] == "Evidence criteria" and result["targets"] == []
+
+
+async def test_discovers_uncached_public_document_inside_named_module(case):
+    case.content["html"] = """<h1>Course content</h1>
+    <details><summary>Week 3 — Integrals</summary>
+      <a href="https://readings.example/lecture.pdf">Lecture notes</a>
+    </details>
+    <a href="https://readings.example/video">Lecture video</a>
+    <a href="https://school.example/content/enforced/999/other.pdf">Other course file</a>
+    <a href="https://readings.example/remove/file.pdf">Remove file</a>
+    <a href="https://readings.example/file.pdf?token=fixture-secret">Protected link</a>
+    <button type="button" aria-controls="lesson" aria-expanded="false">Lecture 2</button>"""
+    opened = await case.tools.run("browser_open", {"source_course_id": "brightspace:123"})
+    assert "Lecture notes" not in {item["label"] for item in opened["targets"]}
+    assert any("visible links" in warning for warning in opened["browser_visit"]["warnings"])
+    assert any("visible controls" in warning for warning in opened["browser_visit"]["warnings"])
+    module = next(t for t in opened["targets"] if t["label"] == "Week 3 — Integrals")
+    expanded = await case.tools.run(
+        "browser_follow",
+        {
+            "snapshot_id": opened["snapshot_id"],
+            "target_id": module["target_id"],
+        },
+    )
+    labels = {item["label"] for item in expanded["targets"]}
+    assert not {"Other course file", "Remove file", "Protected link"} & labels
+    target = next(t for t in expanded["targets"] if t["label"] == "Lecture notes")
+    assert target["kind"] == "document"
+
+    async def read(task, link):
+        assert not case.service.engine.queue_lock.locked()
+        assert not case.contexts[-1].pages
+        assert task["source_course_id"] == "brightspace:123"
+        assert link["url"] == "https://readings.example/lecture.pdf"
+        return {
+            "id": "link:lecture",
+            "title": link["title"],
+            "url": link["url"],
+            "body": "Integration by parts",
+            "course_id": "brightspace:123",
+            "source_task_id": task["id"],
+            "checked_at": now().isoformat(),
+            "warnings": [],
+            "complete": True,
+        }
+
+    case.service.link_reader = SimpleNamespace(read=read)
+    result = await case.tools.run(
+        "browser_follow",
+        {
+            "snapshot_id": expanded["snapshot_id"],
+            "target_id": target["target_id"],
+        },
+    )
+    assert result["documents"][0]["body"] == "Integration by parts"
+    assert "source_task_id" not in result["documents"][0]
+    assert not case.service.store.get("link:lecture")
+
+
+async def test_open_cached_material_source_requires_exposed_id_and_active_scope(case):
+    document = {
+        "id": "material:proof",
+        "provider": "brightspace",
+        "course_id": "brightspace:123",
+        "title": "Proof notes",
+        "body": "Partial notes",
+        "complete": False,
+        "url": "https://school.example/d2l/le/content/123/viewContent/456/View",
+    }
+    case.service.store.upsert_documents([document])
+    with pytest.raises(ValueError, match="returned in this question"):
+        await case.tools.run("browser_open", {"document_id": document["id"]})
+    assert not case.contexts
+    case.tools.documents[document["id"]] = document
+    result = await case.tools.run("browser_open", {"document_id": document["id"]})
+    assert result["browser_visit"]["url"] == document["url"]
+    assert case.received[-1][1] == document["url"]
+
+    case.service.store.upsert_documents([document | {"course_id": "brightspace:999"}])
+    with pytest.raises(ValueError, match="outside"):
+        await case.tools.run("browser_open", {"document_id": document["id"]})
+    assert not case.service.engine.queue_lock.locked()
+
+
+async def test_open_cached_attachment_hands_off_without_opening_browser(case):
+    document = {
+        "id": "material:handout",
+        "provider": "brightspace",
+        "course_id": "brightspace:123",
+        "title": "Handout",
+        "body": "",
+        "complete": False,
+        "url": "https://readings.example/handout.txt",
+    }
+    case.service.store.upsert_documents([document])
+    case.tools.documents[document["id"]] = document
+
+    async def read(task, link):
+        assert not case.contexts and not case.service.engine.queue_lock.locked()
+        assert link["url"] == document["url"]
+        return document | {
+            "body": "The uncached handout",
+            "checked_at": now().isoformat(),
+            "warnings": [],
+            "complete": True,
+        }
+
+    case.service.link_reader = SimpleNamespace(read=read)
+    result = await case.tools.run("browser_open", {"document_id": document["id"]})
+    assert result["documents"][0]["body"] == "The uncached handout"
+    assert result["targets"] == []
+    case.service.engine.paused = True
+    with pytest.raises(ValueError, match="paused"):
+        await case.tools.run("browser_open", {"document_id": document["id"]})
 
 
 async def test_chat_loop_persists_browser_sources_and_closes_browser(case):

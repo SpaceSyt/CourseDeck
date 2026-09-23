@@ -24,10 +24,13 @@ indicator. Stale text does not establish current classifications or automatic
 task associations. The status reports unread cached bodies separately from
 listed headers; successfully visiting every page does not prove complete bodies.
 
-Mail deletion, starring, restoring ignored mail and course overrides only change
-the local database. Disconnect removes the dedicated browser session, retaining
-cached messages, rules and task links. No AI is used and no mail is sent to an AI
-service. Bodies render as text, without remote images, scripts or HTML execution.
+Inbox deletion, starring, restoring ignored mail and course overrides only change
+the local database. Chat can additionally prepare a Gmail Trash operation for an explicit
+reviewed selection; moving those entire conversations requires the user's confirmation in Chat.
+It never permanently deletes or sends mail. See [Chat mail tools](CHAT_TOOLS.md#reviewed-deletion).
+Disconnect removes the dedicated browser session, retaining cached messages, rules and task links.
+Sync and Inbox viewing do not use AI. User-initiated Chat may send requested cached mail excerpts
+to the configured model. Bodies render as text, without remote images, scripts or HTML execution.
 
 ## Classification
 

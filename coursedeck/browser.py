@@ -70,12 +70,16 @@ class BrowserManager:
                 pass
             await self.close_login()
         self.interactive = await self.launch(False, timezone)
+        context = self.interactive
+
+        def closed():
+            # A window closed by the user must not block later background sync.
+            if self.interactive is context:
+                self.interactive = None
+
+        context.once("close", closed)
         try:
-            page = (
-                self.interactive.pages[0]
-                if self.interactive.pages
-                else await self.interactive.new_page()
-            )
+            page = context.pages[0] if context.pages else await context.new_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=45000)
         except BaseException:
             await self.close_login()
@@ -113,7 +117,9 @@ class BrowserManager:
             shutil.rmtree(target)
 
     async def close(self):
-        await self.close_login()
-        if self.playwright is not None:
-            await self.playwright.stop()
-            self.playwright = None
+        try:
+            await self.close_login()
+        finally:
+            playwright, self.playwright = self.playwright, None
+            if playwright is not None:
+                await playwright.stop()

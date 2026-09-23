@@ -10,6 +10,7 @@ from playwright.async_api import TimeoutError as BrowserTimeout
 
 from ..credentials import CredentialStore
 from ..domain import Course, Outcome, SyncResult, Task, TaskScope
+from ..session_resume import login_prompt_visible, resume_session
 from .brightspace_activities import BrightspaceActivities
 from .brightspace_browser_status import BrightspaceBrowserStatus
 from .browser_base import BrowserConnector, session_html
@@ -567,21 +568,24 @@ class BrightspaceConnector(BrowserConnector):
         # context.request cannot perform that flow and can return 403 despite a valid login.
         page = await context.new_page()
         await page.goto(self.base_url + "/d2l/home", wait_until="domcontentloaded", timeout=45000)
-        try:
-            await page.wait_for_url(
-                lambda url: (
-                    urlparse(url).netloc == urlparse(self.base_url).netloc
-                    and urlparse(url).path.startswith("/d2l/home")
-                ),
-                timeout=30000,
+        if not await resume_session(
+            page,
+            lambda url: (
+                urlparse(url).scheme == "https"
+                and urlparse(url).netloc == urlparse(self.base_url).netloc
+                and urlparse(url).path.rstrip("/") == "/d2l/home"
+            ),
+            timeout_ms=30000,
+        ):
+            own_login = (
+                urlparse(page.url).netloc == urlparse(self.base_url).netloc
+                and await page.locator('input[type="password"]:visible').count()
             )
-        except BrowserTimeout as exc:
-            login = await page.locator('input[type="password"], input[type="email"]').count()
-            if login or urlparse(page.url).netloc != urlparse(self.base_url).netloc:
+            if own_login or await login_prompt_visible(page):
                 raise TransportError(
                     Outcome.AUTH_REQUIRED, "Brightspace needs school sign-in. Reconnect."
-                ) from exc
-            raise
+                )
+            raise BrowserTimeout("Brightspace sign-in redirect did not finish")
         if not await self.validate_session(context):
             raise TransportError(
                 Outcome.PARSE_ERROR, "Could not confirm the Brightspace home page. Retry sync."

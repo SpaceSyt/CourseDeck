@@ -1,3 +1,5 @@
+import type { MailDeletionPlanData } from './MailDeletionPlan';
+
 /** Incrementally decode SSE, including UTF-8 characters split across network chunks. */
 export async function readChatStream(
   response: Response,
@@ -44,6 +46,16 @@ export interface ChatActivity {
   label: string;
   status?: 'running' | 'done' | 'error';
   detail?: string;
+  memory_change?: { id: string; text: string; status: 'active' | 'pending' };
+  mail_deletion_plan?: MailDeletionPlanData;
+  inbox_preview?: { action: string; matched: number; changed: number };
+  inbox_change?: {
+    action: string;
+    matched: number;
+    changed: number;
+    has_more: boolean;
+    messages: { id: string; subject: string }[];
+  };
   browser_visit?: { url: string; title: string; checked_at: string; warnings: string[] };
   mail_rule_preview?: { changed: number; newly_ignored: number; new_conflicts: number };
   mail_rule_change?: {

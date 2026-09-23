@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { bucket, completed, dayNumber, sourceWarning } from './tasks';
+import { bucket, completed, dayKey, dayNumber, sourceWarning } from './tasks';
 import type { Task } from './types';
 
 const task = (due: string | null, dismissed = false) =>
@@ -16,6 +16,26 @@ describe('deadline grouping', () => {
       dayNumber(new Date('2026-11-02T05:30:00Z'), 'America/New_York') -
         dayNumber(now, 'America/New_York'),
     ).toBe(1);
+  });
+  it('updates calendar dates when the workspace timezone changes and changes back', () => {
+    const date = new Date('2026-09-05T02:00:00Z');
+    for (const [zone, expected] of [
+      ['America/New_York', '2026-09-04'],
+      ['Asia/Shanghai', '2026-09-05'],
+      ['America/New_York', '2026-09-04'],
+    ]) {
+      expect(dayKey(date, zone)).toBe(expected);
+      expect(dayNumber(date, zone)).toBe(Date.parse(`${expected}T00:00:00Z`) / 86400000);
+    }
+  });
+  it('keeps spring DST deadlines on their calendar day with reused formatters', () => {
+    const zone = 'America/New_York';
+    const before = new Date('2026-03-08T05:30:00Z');
+    const after = new Date('2026-03-09T04:30:00Z');
+    expect(dayKey(before, zone)).toBe('2026-03-08');
+    expect(dayKey(after, zone)).toBe('2026-03-09');
+    expect(dayNumber(after, zone) - dayNumber(before, zone)).toBe(1);
+    expect(bucket(task(after.toISOString()), zone, before)).toBe('Tomorrow');
   });
   it('shows a passed deadline today as overdue and keeps undated work visible', () => {
     const now = new Date('2026-09-05T18:00:00Z');

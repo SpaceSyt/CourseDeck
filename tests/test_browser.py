@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -48,3 +49,60 @@ async def test_profile_reset_confined_to_provider(tmp_path, provider):
     browser.path = other
     with pytest.raises(ValueError):
         await browser.reset()
+
+
+async def test_closed_login_window_allows_background_sync(tmp_path, monkeypatch):
+    browser = BrowserManager(tmp_path, "gradescope")
+    launch = browser.launch
+
+    async def headless_login(headless, timezone=None, *, read_only=False):
+        return await launch(True, timezone, read_only=read_only)
+
+    monkeypatch.setattr(browser, "launch", headless_login)
+    try:
+        await browser.login("data:text/html,<title>Fixture login</title>")
+        context = browser.interactive
+        assert context is not None
+        with pytest.raises(ValueError, match="Finish interactive login"):
+            async with browser.session():
+                pytest.fail("An open login window must retain exclusive profile access")
+
+        # Closing Chromium externally must work without calling close_login().
+        async with context.expect_event("close"):
+            await context.browser.close()
+        assert browser.interactive is None
+        async with browser.session(read_only=True) as background:
+            page = background.pages[0]
+            await page.goto("data:text/html,<title>Background sync</title>")
+            assert await page.title() == "Background sync"
+
+        await browser.login("data:text/html,<title>Reconnect</title>")
+        assert await browser.interactive.pages[0].title() == "Reconnect"
+    finally:
+        await browser.close()
+    assert browser.interactive is None and browser.playwright is None
+
+
+async def test_shutdown_releases_driver_when_login_close_fails(tmp_path):
+    browser = BrowserManager(tmp_path, "gradescope")
+    context = AsyncMock()
+    context.close.side_effect = RuntimeError("synthetic close failure")
+    driver = AsyncMock()
+    browser.interactive = context
+    browser.playwright = driver
+    with pytest.raises(RuntimeError, match="synthetic close failure"):
+        await browser.close()
+    driver.stop.assert_awaited_once()
+    assert browser.interactive is None and browser.playwright is None
+
+
+async def test_failed_driver_shutdown_does_not_reuse_stopped_driver(tmp_path):
+    browser = BrowserManager(tmp_path, "gradescope")
+    driver = AsyncMock()
+    driver.stop.side_effect = RuntimeError("synthetic driver failure")
+    browser.playwright = driver
+    with pytest.raises(RuntimeError, match="synthetic driver failure"):
+        await browser.close()
+    assert browser.playwright is None
+    await browser.close()
+    driver.stop.assert_awaited_once()

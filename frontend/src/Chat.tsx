@@ -1,31 +1,29 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowUp, ArrowUpRight, Loader2, MessageSquare, Plus, Search } from 'lucide-react';
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpRight,
+  Check,
+  Copy,
+  Loader2,
+  MessageSquare,
+  Pencil,
+  Plus,
+  Search,
+  Trash2,
+} from 'lucide-react';
 import type { Course } from './types';
 import { api } from './api';
-import { readChatStream, mergeActivity, type ChatActivity } from './chat-stream';
+import { chatSessions, useChatSessions } from './chat-session-store';
 import { ChatMarkdown, citationUrl, type Citation } from './ChatMarkdown';
 import './chat.css';
 
-import type {
-  ChatMessage,
-  ChatConfig,
-  ChatResponse,
-  Conversation,
-  Material,
-  TaskContext,
-} from './chat-types';
+import type { ChatConfig, Material, TaskContext } from './chat-types';
 import { MaterialLibrary } from './MaterialLibrary';
+import { ChatMemories } from './ChatMemories';
 import { Activity } from './ChatActivity';
 import { ConversationTitleEditor } from './ConversationTitleEditor';
 export { AISettings } from './AISettings';
-
-class ChatError extends Error {
-  conversationId?: string;
-  constructor(message: string, conversationId?: string) {
-    super(message);
-    this.conversationId = conversationId;
-  }
-}
 
 export function Chat({
   courses,
@@ -38,76 +36,62 @@ export function Chat({
   initialTaskId?: string;
   initialDocumentId?: string;
 }) {
-  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const state = useChatSessions();
+  const session = state.sessions[state.selected];
+  const {
+    id: conversationId,
+    courseId,
+    taskId,
+    messages,
+    draft,
+    fetchMaterials,
+    busy,
+    loading,
+    error,
+    pendingMessage,
+    streamText,
+    activity,
+  } = session;
+  const patch = (values: Partial<typeof session>) => chatSessions.patch(session.key, values);
   const [renaming, setRenaming] = useState<string | null>(null);
-  const [view, setView] = useState<'conversation' | 'materials'>('conversation');
+  const [view, setView] = useState<'conversation' | 'materials' | 'memories'>('conversation');
   const [libraryCitation, setLibraryCitation] = useState<Citation | null>(null);
-  const [conversationId, setConversationId] = useState<string | null>(null);
-  const [courseId, setCourseId] = useState(initialCourseId ?? '');
-  const [taskId, setTaskId] = useState<string | null>(initialTaskId ?? null);
   const [taskContext, setTaskContext] = useState<TaskContext | null>(null);
   const [taskLoading, setTaskLoading] = useState(!!initialTaskId);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [draft, setDraft] = useState('');
-  const [fetchMaterials, setFetchMaterials] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
   const [credentialError, setCredentialError] = useState('');
-  const [pendingMessage, setPendingMessage] = useState('');
-  const [streamText, setStreamText] = useState('');
-  const [activity, setActivity] = useState<ChatActivity[]>([]);
-  const stopped = useRef(false);
-  const bottom = useRef<HTMLDivElement>(null);
-  const mounted = useRef(true);
-  const selection = useRef(0);
-  const request = useRef<AbortController | null>(null);
-  const sending = useRef(false);
-
-  const refreshConversations = async () => {
-    const response = await api<{ conversations: Conversation[] }>('/chat/conversations');
-    if (mounted.current) setConversations(response.conversations);
-  };
-  const loadConversation = async (id: string) => {
-    const sequence = ++selection.current;
-    setLoading(true);
-    setError('');
-    try {
-      const response = await api<Conversation & { messages: ChatMessage[] }>(
-        `/chat/conversations/${encodeURIComponent(id)}`,
-      );
-      if (mounted.current && selection.current === sequence) {
-        setConversationId(response.id);
-        setCourseId(response.course_id ?? '');
-        setTaskId(response.task_id ?? null);
-        setMessages(response.messages);
-        setStreamText('');
-        setActivity([]);
-        return true;
-      }
-    } catch (e) {
-      if (mounted.current && selection.current === sequence) setError((e as Error).message);
-    } finally {
-      if (mounted.current && selection.current === sequence) setLoading(false);
-    }
-    return false;
-  };
+  const [copied, setCopied] = useState<string | null>(null);
+  const [following, setFollowing] = useState(true);
+  const scroll = useRef<HTMLDivElement>(null);
+  const follow = useRef(true);
+  const initialized = useRef(false);
+  const history = [
+    ...Object.values(state.sessions)
+      .filter(
+        (item) =>
+          (item.busy || item.draft || item.messages.length || item.error) &&
+          !state.conversations.some((conversation) => conversation.id === item.id),
+      )
+      .map((item) => ({ id: item.id ?? item.key, title: item.title, course_id: item.courseId })),
+    ...state.conversations,
+  ];
   useEffect(() => {
-    mounted.current = true;
-    void refreshConversations().catch((e: Error) => {
-      if (mounted.current) setError(e.message);
-    });
+    if (!initialized.current) {
+      initialized.current = true;
+      if (initialCourseId || initialTaskId)
+        chatSessions.newConversation(initialCourseId ?? '', initialTaskId ?? null);
+    }
+    let active = true;
+    void chatSessions.refresh();
+    void chatSessions.select(chatSessions.state.selected);
     void api<ChatConfig>('/chat/config')
       .then((config) => {
-        if (mounted.current) setCredentialError(config.credential_error ?? '');
+        if (active) setCredentialError(config.credential_error ?? '');
       })
       .catch((e: Error) => {
-        if (mounted.current) setError((current) => current || e.message);
+        if (active) setCredentialError(e.message);
       });
     return () => {
-      mounted.current = false;
-      selection.current += 1;
-      request.current?.abort();
+      active = false;
     };
   }, []);
   useEffect(() => {
@@ -119,11 +103,11 @@ export function Chat({
         .then((context) => {
           if (active) {
             setTaskContext(context);
-            setCourseId(context.task.course_id ?? '');
+            chatSessions.patch(session.key, { courseId: context.task.course_id ?? '' });
           }
         })
         .catch((e: Error) => {
-          if (active) setError(e.message);
+          if (active) chatSessions.patch(session.key, { error: e.message });
         })
         .finally(() => {
           if (active) setTaskLoading(false);
@@ -131,7 +115,7 @@ export function Chat({
     return () => {
       active = false;
     };
-  }, [taskId]);
+  }, [taskId, session.key]);
   useEffect(() => {
     let active = true;
     if (initialDocumentId)
@@ -143,152 +127,42 @@ export function Chat({
           }
         })
         .catch((e: Error) => {
-          if (active) setError(e.message);
+          if (active) chatSessions.patch(session.key, { error: e.message });
         });
     return () => {
       active = false;
     };
   }, [initialDocumentId]);
   useEffect(() => {
-    bottom.current?.scrollIntoView({ block: 'nearest' });
-  }, [messages, pendingMessage, streamText]);
+    follow.current = true;
+    setFollowing(true);
+    if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight;
+  }, [session.key, view]);
+  useEffect(() => {
+    if (follow.current && scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight;
+  }, [messages, pendingMessage, streamText, activity, loading]);
 
-  const newConversation = (course = courseId) => {
-    selection.current += 1;
-    setLoading(false);
-    setConversationId(null);
-    setCourseId(course);
-    setTaskId(null);
-    setMessages([]);
-    setActivity([]);
-    setStreamText('');
-    setError('');
-  };
+  const newConversation = (course = courseId) => chatSessions.newConversation(course);
   const openCitation = (citation: Citation) => {
-    if (citation.kind === 'linked_document' && citationUrl(citation.url)) {
+    if (['linked_document', 'browser_page'].includes(citation.kind) && citationUrl(citation.url)) {
       window.open(citationUrl(citation.url), '_blank', 'noopener,noreferrer');
       return;
     }
     setLibraryCitation(citation);
     setView('materials');
   };
-  const send = async () => {
-    const content = draft.trim();
-    if (!content || sending.current || loading || taskLoading) return;
-    sending.current = true;
-    setBusy(true);
-    setError('');
-    setPendingMessage(content);
-    setStreamText('');
-    setActivity([]);
-    stopped.current = false;
-    const controller = new AbortController();
-    request.current = controller;
-    const timeout = window.setTimeout(() => controller.abort(), 300000);
-    let savedConversation: string | undefined;
-    let receivedText = '';
-    let receivedActivity: ChatActivity[] = [];
-    let completedReply = false;
+  const send = () => {
+    if (taskLoading || !draft.trim() || busy) return;
+    follow.current = true;
+    setFollowing(true);
+    void chatSessions.send(session.key);
+  };
+  const copy = async (messageId: string, content: string) => {
     try {
-      const response = await fetch('/api/chat/messages/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CourseDeck': '1' },
-        body: JSON.stringify({
-          message: content,
-          conversation_id: conversationId ?? undefined,
-          course_id: courseId || undefined,
-          task_id: taskId ?? undefined,
-          fetch_materials: fetchMaterials,
-        }),
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        const result = await response.json().catch(() => ({}));
-        const detail = result.detail;
-        throw new ChatError(
-          typeof detail === 'string'
-            ? detail
-            : detail?.message || `Request failed (${response.status}).`,
-          detail?.conversation_id,
-        );
-      }
-      await readChatStream(response, (event) => {
-        if (!mounted.current) return;
-        if (event.type === 'session') {
-          savedConversation = event.conversation_id as string;
-          setConversationId(savedConversation);
-          setMessages((current) => [...current, event.message as ChatMessage]);
-          setPendingMessage('');
-          setDraft('');
-        } else if (event.type === 'answer_start') {
-          receivedText = '';
-          setStreamText('');
-        } else if (event.type === 'delta') {
-          receivedText += String(event.text);
-          setStreamText((current) => current + String(event.text));
-        } else if (event.type === 'activity') {
-          receivedActivity = mergeActivity(receivedActivity, event as unknown as ChatActivity);
-          setActivity((current) => mergeActivity(current, event as unknown as ChatActivity));
-        } else if (event.type === 'done') {
-          completedReply = true;
-          const answer = event as unknown as ChatResponse;
-          setMessages((current) => [...current, answer.message]);
-          setStreamText('');
-          setActivity([]);
-        } else if (event.type === 'error') {
-          throw new ChatError(String(event.message), event.conversation_id as string | undefined);
-        }
-      });
-    } catch (e) {
-      if (!mounted.current) return;
-      const failure = e as ChatError;
-      savedConversation = failure.conversationId ?? savedConversation;
-      if (
-        controller.signal.aborted &&
-        !completedReply &&
-        (receivedText || receivedActivity.some((step) => step.id))
-      ) {
-        setMessages((current) => [
-          ...current,
-          {
-            id: `interrupted-${Date.now()}`,
-            role: 'assistant',
-            content: receivedText,
-            activity: receivedActivity,
-            warnings: ['Reply interrupted.'],
-          },
-        ]);
-        setStreamText('');
-        setActivity([]);
-      }
-      if (savedConversation && !controller.signal.aborted) {
-        setConversationId(savedConversation);
-        const restored = await loadConversation(savedConversation);
-        if (mounted.current && restored) {
-          setDraft('');
-          setStreamText('');
-          setActivity([]);
-        }
-      }
-      if (mounted.current)
-        setError(
-          controller.signal.aborted
-            ? stopped.current
-              ? 'Stopped.'
-              : 'Response timed out. Check this conversation before sending again.'
-            : failure.message,
-        );
-    } finally {
-      window.clearTimeout(timeout);
-      request.current = null;
-      sending.current = false;
-      if (mounted.current) {
-        setBusy(false);
-        setPendingMessage('');
-        void refreshConversations().catch(() => {
-          if (mounted.current) setError((current) => current || 'Could not refresh chat history.');
-        });
-      }
+      await navigator.clipboard.writeText(content);
+      setCopied(messageId);
+    } catch {
+      patch({ error: 'Could not copy the answer.' });
     }
   };
 
@@ -296,7 +170,7 @@ export function Chat({
     <select
       aria-label="Chat course"
       value={courseId}
-      disabled={busy || loading || taskLoading}
+      disabled={loading || taskLoading}
       onChange={(e) => newConversation(e.target.value)}
     >
       <option value="">All courses</option>
@@ -314,7 +188,6 @@ export function Chat({
     <div className="chat-workspace">
       <aside className="chat-history" aria-label="Chat history">
         <button
-          disabled={busy}
           onClick={() => {
             setView('conversation');
             newConversation();
@@ -323,46 +196,87 @@ export function Chat({
           <Plus size={16} /> New chat
         </button>
         <div className="chat-history-list">
-          {conversations.map((conversation) =>
-            renaming === conversation.id ? (
+          {history.map((conversation) => {
+            const item = Object.values(state.sessions).find(
+              (entry) => entry.id === conversation.id || entry.key === conversation.id,
+            );
+            const selected = item?.key === session.key;
+            const saved = item ? !!item.id : true;
+            return renaming === conversation.id ? (
               <ConversationTitleEditor
                 key={conversation.id}
                 conversation={conversation}
                 cancel={() => setRenaming(null)}
                 saved={(title) => {
-                  setConversations((current) =>
-                    current.map((item) =>
-                      item.id === conversation.id ? { ...item, title } : item,
-                    ),
-                  );
+                  chatSessions.rename(conversation.id, title);
                   setRenaming(null);
                 }}
               />
             ) : (
-              <button
+              <div
                 key={conversation.id}
-                className={conversationId === conversation.id ? 'selected' : ''}
-                aria-pressed={conversationId === conversation.id}
-                disabled={busy}
-                title={`${conversation.title} · Double-click to rename`}
-                onDoubleClick={() => setRenaming(conversation.id)}
-                onKeyDown={(event) => {
-                  if (event.key === 'F2') {
-                    event.preventDefault();
-                    setRenaming(conversation.id);
-                  }
-                }}
-                onClick={() => {
-                  setView('conversation');
-                  void loadConversation(conversation.id);
-                }}
+                className={`chat-history-row${selected ? ' selected' : ''}`}
               >
-                <MessageSquare size={14} />
-                <span>{conversation.title}</span>
-              </button>
-            ),
-          )}
+                <button
+                  className="chat-history-select"
+                  aria-pressed={selected}
+                  title={conversation.title}
+                  onDoubleClick={() => {
+                    if (saved) setRenaming(conversation.id);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'F2' && saved) {
+                      event.preventDefault();
+                      setRenaming(conversation.id);
+                    }
+                  }}
+                  onClick={() => {
+                    setView('conversation');
+                    void chatSessions.select(conversation.id);
+                  }}
+                >
+                  {item?.busy ? (
+                    <Loader2 size={14} className="spin" aria-label="Generating" />
+                  ) : (
+                    <MessageSquare size={14} />
+                  )}
+                  <span>{conversation.title}</span>
+                  {item?.error && (
+                    <span className="chat-history-status" aria-label="Conversation needs attention">
+                      !
+                    </span>
+                  )}
+                </button>
+                <button
+                  className="chat-history-action"
+                  aria-label={`Rename ${conversation.title}`}
+                  title="Rename"
+                  disabled={!saved || item?.deleting}
+                  onClick={() => setRenaming(conversation.id)}
+                >
+                  <Pencil size={13} />
+                </button>
+                <button
+                  className="chat-history-action"
+                  aria-label={`Delete ${conversation.title}`}
+                  title={item?.busy ? 'Stop the reply before deleting' : 'Delete chat'}
+                  disabled={item?.busy || item?.deleting}
+                  onClick={() => {
+                    if (window.confirm('Delete this chat and its messages?'))
+                      void chatSessions.remove(conversation.id);
+                  }}
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
+            );
+          })}
         </div>
+        {state.historyError && (
+          <p className="warning" role="alert">
+            {state.historyError}
+          </p>
+        )}
       </aside>
 
       <div className="chat-main">
@@ -380,10 +294,13 @@ export function Chat({
             >
               Materials
             </button>
+            <button aria-pressed={view === 'memories'} onClick={() => setView('memories')}>
+              Memories
+            </button>
           </div>
-          {courseSelector}
+          {view !== 'memories' && courseSelector}
         </div>
-        {taskId && (
+        {taskId && view !== 'memories' && (
           <div className="chat-task-context" aria-label="Task context">
             <strong>
               {taskContext?.task.title ?? (taskLoading ? 'Loading task…' : 'Task unavailable')}
@@ -409,16 +326,31 @@ export function Chat({
           </div>
         )}
         {view === 'materials' ? (
-          <MaterialLibrary courseId={courseId} initialCitation={libraryCitation} />
+          <MaterialLibrary
+            courseId={courseId}
+            initialCitation={libraryCitation}
+            conversationId={conversationId}
+          />
+        ) : view === 'memories' ? (
+          <ChatMemories courses={courses} initialCourseId={courseId} />
         ) : (
           <section className="chat-panel" aria-label="Conversation">
             <div
+              ref={scroll}
               className="chat-messages"
+              onScroll={() => {
+                const element = scroll.current;
+                if (element) {
+                  follow.current =
+                    element.scrollHeight - element.scrollTop - element.clientHeight < 64;
+                  setFollowing(follow.current);
+                }
+              }}
               role="log"
               aria-label="Messages"
               aria-busy={busy || loading}
             >
-              {loading ? (
+              {loading && !messages.length ? (
                 <p className="chat-placeholder">
                   <Loader2 size={18} className="spin" /> Loading…
                 </p>
@@ -426,9 +358,21 @@ export function Chat({
                 <>
                   {messages.map((message) => (
                     <article className={`chat-message ${message.role}`} key={message.id}>
-                      <span className="chat-role">
-                        {message.role === 'user' ? 'You' : 'Assistant'}
-                      </span>
+                      <div className="chat-message-header">
+                        <span className="chat-role">
+                          {message.role === 'user' ? 'You' : 'Assistant'}
+                        </span>
+                        {message.role === 'assistant' && message.content && (
+                          <button
+                            className="chat-copy"
+                            aria-label={copied === message.id ? 'Copied' : 'Copy answer'}
+                            title={copied === message.id ? 'Copied' : 'Copy answer'}
+                            onClick={() => void copy(message.id, message.content)}
+                          >
+                            {copied === message.id ? <Check size={14} /> : <Copy size={14} />}
+                          </button>
+                        )}
+                      </div>
                       {!!message.activity?.length && <Activity items={message.activity} />}
                       <div className="chat-message-content">
                         {message.role === 'assistant' ? (
@@ -486,8 +430,19 @@ export function Chat({
                   )}
                 </>
               )}
-              <div ref={bottom} />
             </div>
+            {!following && (
+              <button
+                className="chat-latest"
+                onClick={() => {
+                  follow.current = true;
+                  setFollowing(true);
+                  if (scroll.current) scroll.current.scrollTop = scroll.current.scrollHeight;
+                }}
+              >
+                <ArrowDown size={14} /> Latest
+              </button>
+            )}
             <div className="chat-feedback">
               {credentialError && (
                 <p className="warning" role="alert">
@@ -513,8 +468,8 @@ export function Chat({
                 rows={3}
                 maxLength={12000}
                 value={draft}
-                disabled={busy || loading}
-                onChange={(e) => setDraft(e.target.value)}
+                disabled={loading || session.deleting}
+                onChange={(e) => patch({ draft: e.target.value })}
                 onKeyDown={(e) => {
                   if (
                     e.key === 'Enter' &&
@@ -532,19 +487,23 @@ export function Chat({
                   type="button"
                   className="chat-material-toggle"
                   aria-pressed={fetchMaterials}
-                  disabled={busy || loading}
-                  onClick={() => setFetchMaterials(!fetchMaterials)}
+                  title={
+                    courseId
+                      ? 'Refresh course materials before answering'
+                      : 'Select a course to refresh materials'
+                  }
+                  disabled={!courseId || loading || session.deleting}
+                  onClick={() => patch({ fetchMaterials: !fetchMaterials })}
                 >
                   <Search size={15} />
-                  Find materials
+                  Refresh materials
                 </button>
                 {busy ? (
                   <button
                     type="button"
                     className="chat-stop"
                     onClick={() => {
-                      stopped.current = true;
-                      request.current?.abort();
+                      chatSessions.stop(session.key);
                     }}
                   >
                     Stop

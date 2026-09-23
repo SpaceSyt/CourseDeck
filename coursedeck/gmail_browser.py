@@ -8,6 +8,7 @@ import asyncio
 import re
 from collections import Counter
 from datetime import timedelta
+from urllib.parse import urlsplit
 
 from playwright.async_api import Error as BrowserError
 from playwright.async_api import TimeoutError as BrowserTimeout
@@ -16,6 +17,7 @@ from .browser import BrowserManager, installed_chrome_channel
 from .domain import now
 from .gmail_sync import advance_history, history_page, parse_received_at, select_body_ids
 from .mail import MailMessage, MailStore
+from .session_resume import login_prompt_visible, resume_session
 
 INBOX = "https://mail.google.com/mail/u/0/#inbox"
 BODY_READS_PER_PAGE = 8
@@ -24,6 +26,16 @@ VISIBLE_ROWS = "tr.zA:visible"
 
 class GmailLoginRequired(ValueError):
     pass
+
+
+def gmail_url(url):
+    parsed = urlsplit(url)
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "mail.google.com"
+        and parsed.port in (None, 443)
+        and parsed.path.startswith("/mail/")
+    )
 
 
 # Gmail's visible inbox rows. Never replay private RPCs or copy session tokens.
@@ -122,15 +134,19 @@ class GmailBrowser:
             context = self.browser.interactive
             if not context:
                 raise ValueError("Open Gmail login first")
-            page = next(
-                (p for p in context.pages if p.url.startswith("https://mail.google.com/")), None
-            )
+            page = next((p for p in context.pages if gmail_url(p.url)), None)
+            if page is None:
+                page = next(
+                    (p for p in context.pages if urlsplit(p.url).hostname == "accounts.google.com"),
+                    None,
+                )
             if not page:
                 raise ValueError("Finish signing in to Gmail first")
             await page.goto(INBOX, wait_until="domcontentloaded")
             try:
+                await self._resume_session(page)
                 await page.locator('[role="main"]').first.wait_for(timeout=30000)
-            except BrowserTimeout as exc:
+            except (BrowserTimeout, GmailLoginRequired) as exc:
                 raise ValueError("Gmail inbox is not ready. Complete login and retry.") from exc
             account = await self.account(page)
             if not account:
@@ -188,11 +204,21 @@ class GmailBrowser:
                     error="Could not read the Gmail inbox. Retry sync.",
                 )
 
+    async def _resume_session(self, page):
+        if gmail_url(page.url):
+            return
+        if await resume_session(
+            page, gmail_url, expected_account=self.db.state("gmail").get("account")
+        ):
+            return
+        if await login_prompt_visible(page):
+            raise GmailLoginRequired()
+        raise BrowserTimeout("Gmail sign-in redirect did not finish")
+
     async def _inbox_page(self, page, number=1, page_size=None):
         url = INBOX if number == 1 else f"{INBOX}/p{number}"
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        if "accounts.google.com" in page.url:
-            raise GmailLoginRequired()
+        await self._resume_session(page)
         await page.locator('[role="main"]').first.wait_for(timeout=30000)
         account = await self.account(page)
         if not account or account != self.db.state("gmail").get("account"):
@@ -322,8 +348,6 @@ class GmailBrowser:
                 if not value.body_complete:
                     failures += 1
             except BrowserTimeout:
-                if "accounts.google.com" in page.url:
-                    raise GmailLoginRequired() from None
                 failures += 1
             await self._inbox_page(page, number, page_size)
         return failures

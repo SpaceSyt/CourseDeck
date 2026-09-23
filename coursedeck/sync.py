@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import Coroutine
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import timedelta
@@ -8,8 +9,9 @@ from .connectors.http import TransportError
 from .db import Database
 from .domain import Outcome, SyncResult, now
 
-AUTO_SYNC_INTERVAL_SECONDS = 30 * 60
+AUTO_SYNC_INTERVAL_SECONDS = 10 * 60
 RETRY_DELAYS = (15, 60)
+logger = logging.getLogger(__name__)
 
 
 class SyncEngine:
@@ -61,8 +63,7 @@ class SyncEngine:
     async def retry(self, key, delay, attempt):
         try:
             await asyncio.sleep(delay)
-            if self.connectors[key].connection_status() == "connected":
-                await self.sync_one(key, automatic=True, retry_attempt=attempt)
+            await self._sync_connected(key, automatic=True, retry_attempt=attempt)
         finally:
             if self.retries.get(key) is asyncio.current_task():
                 self.retries.pop(key, None)
@@ -72,16 +73,16 @@ class SyncEngine:
             self.running.add(key)
             self.revision += 1
             attempted = now().isoformat()
-            self.db.update_state(key, last_attempted_sync=attempted)
             stage = "source_read"
-            self.diagnostic(
-                key,
-                stage,
-                retry_attempt=retry_attempt,
-                retry_limit=len(RETRY_DELAYS),
-                next_retry_at=None,
-            )
             try:
+                self.db.update_state(key, last_attempted_sync=attempted)
+                self.diagnostic(
+                    key,
+                    stage,
+                    retry_attempt=retry_attempt,
+                    retry_limit=len(RETRY_DELAYS),
+                    next_retry_at=None,
+                )
                 try:
                     result = await asyncio.wait_for(self.connectors[key].sync(), timeout=180)
                 except TimeoutError:
@@ -179,19 +180,46 @@ class SyncEngine:
                 self.running.discard(key)
                 self.revision += 1
 
+    async def _sync_connected(self, key, *, automatic=False, retry_attempt=0):
+        try:
+            if self.connectors[key].connection_status() == "connected":
+                await self.sync_one(key, automatic=automatic, retry_attempt=retry_attempt)
+        except Exception as exc:
+            # Exception text can contain credentials; retain only the error category.
+            logger.error("Source scheduling failed for %s (%s)", key, type(exc).__name__)
+            try:
+                self.db.update_state(
+                    key,
+                    last_outcome=Outcome.ERROR,
+                    warnings=["Sync could not run; cached data retained."],
+                )
+                self.diagnostic(
+                    key, "scheduler", category="error", action="review", next_retry_at=None
+                )
+            except Exception as state_error:
+                logger.error("Sync status could not be saved (%s)", type(state_error).__name__)
+
     async def sync_all(self, *, automatic=False):
         if self.paused or self.batch_lock.locked():
             return
         async with self.batch_lock:
-            for key, connector in self.connectors.items():
-                if connector.connection_status() == "connected":
-                    await self.sync_one(key, automatic=automatic)
+            # Reserve the whole round in the shared serial queue so a manual request
+            # cannot complete a later source and then repeat it within this same round.
+            await asyncio.gather(
+                *(
+                    self.spawn(self._sync_connected(key, automatic=automatic))
+                    for key in self.connectors
+                )
+            )
 
     async def poll(self):
         while True:
             await asyncio.sleep(AUTO_SYNC_INTERVAL_SECONDS)
             # Await the round so a slow sync never builds up periodic jobs.
-            await self.sync_all(automatic=True)
+            try:
+                await self.sync_all(automatic=True)
+            except Exception as exc:
+                logger.error("Automatic sync round failed (%s)", type(exc).__name__)
 
     @asynccontextmanager
     async def maintenance(self, *, can_resume=lambda: True):

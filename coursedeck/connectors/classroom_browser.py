@@ -10,13 +10,16 @@ import re
 from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import Error as BrowserError
+from playwright.async_api import TimeoutError as BrowserTimeout
 
 from ..domain import Course, Outcome, SyncResult, Task
+from ..session_resume import login_prompt_visible, resume_session
 from .browser_base import BrowserConnector
 from .classroom_webdata import assignment_timing
 from .http import TransportError
 
 ORIGIN = "https://classroom.google.com"
+SESSION_REDIRECT_TIMEOUT_MS = 20000
 COURSE_PATH = re.compile(r"/(?:u/\d+/)?c/([A-Za-z0-9_-]+)/?")
 TASK_PATH = re.compile(r"/(?:u/\d+/)?c/([A-Za-z0-9_-]+)/a/([A-Za-z0-9_-]+)/details/?")
 LINKS_JS = """() => [...document.querySelectorAll('a[href]')].map(a => ({
@@ -250,15 +253,37 @@ class ClassroomBrowserConnector(BrowserConnector):
     async def read_page(self, page, url):
         if not classroom_path(url):
             raise ValueError("Classroom reader only accepts Classroom pages")
-        response = await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        try:
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        except BrowserError as exc:
+            raise TransportError(
+                Outcome.NETWORK_ERROR, "Classroom page could not load. Retry sync."
+            ) from exc
         if response and response.status == 429:
             raise TransportError(
                 Outcome.RATE_LIMITED, "Google is rate limiting requests. Retry later."
             )
         if response and response.status >= 500:
             raise TransportError(Outcome.NETWORK_ERROR, "Classroom is temporarily unavailable.")
-        if not classroom_path(page.url) or (response and response.status in {401, 403}):
+        if not classroom_path(page.url):
+            if not await resume_session(
+                page,
+                lambda target: bool(classroom_path(target)),
+                timeout_ms=SESSION_REDIRECT_TIMEOUT_MS,
+            ):
+                if await login_prompt_visible(page):
+                    raise TransportError(
+                        Outcome.AUTH_REQUIRED, "Classroom session expired. Reconnect."
+                    )
+                raise TransportError(
+                    Outcome.NETWORK_ERROR, "Classroom sign-in redirect did not finish. Retry sync."
+                )
+        if response and classroom_path(response.url) and response.status == 401:
             raise TransportError(Outcome.AUTH_REQUIRED, "Classroom session expired. Reconnect.")
+        if response and classroom_path(response.url) and response.status == 403:
+            raise TransportError(
+                Outcome.PARSE_ERROR, "Classroom denied access to this page; cached data retained."
+            )
         # Classroom renders asynchronously. Wait for content, never for networkidle
         # (Google pages retain background connections).
         path = classroom_path(url)
@@ -578,10 +603,12 @@ class ClassroomBrowserConnector(BrowserConnector):
             result.warnings.append(exc.safe_message)
             if exc.outcome == Outcome.AUTH_REQUIRED:
                 self.db.update_state(self.key, authorized=False)
+        except BrowserTimeout:
+            result.outcome = Outcome.PARTIAL if result.courses else Outcome.NETWORK_ERROR
+            result.warnings.append(
+                "Classroom page did not finish loading. Retry sync; cached tasks retained."
+            )
         except BrowserError:
             result.outcome = Outcome.PARTIAL if result.courses else Outcome.PARSE_ERROR
-            result.warnings.append(
-                "Classroom page could not be read. Reopen login to check the session; "
-                "saved tasks retained."
-            )
+            result.warnings.append("Classroom page could not be read; cached tasks retained.")
         return result

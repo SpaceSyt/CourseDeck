@@ -479,7 +479,7 @@ async def test_model_max_completion_tokens_compatibility_is_explicit(tmp_path):
     service = await configured(tmp_path, handler)
     result = await service.send(ChatMessageInput(message="Hi", course_id="test:math"))
     assert result["message"]["content"] == "Compatible reply"
-    assert len(requests) == 2 and requests[-1]["max_completion_tokens"] == 2000
+    assert len(requests) == 2 and requests[-1]["max_completion_tokens"] == 8192
 
 
 async def test_existing_conversation_follows_merged_course_scope(tmp_path):
