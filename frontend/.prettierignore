@@ -1,0 +1,2 @@
+# Python-generated contracts are checked byte-for-byte by export_task_contract.py.
+src/task-contract.json

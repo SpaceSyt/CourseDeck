@@ -1,0 +1,122 @@
+.task-relations {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.task-relations-description {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 320px;
+  overflow: auto;
+  line-height: 1.6;
+}
+.task-relations-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.task-relations-heading h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+.task-relations button,
+.task-relations input,
+.task-relations select {
+  font: inherit;
+}
+.task-relations button {
+  cursor: pointer;
+}
+.task-relations button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.task-relations-add {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.task-relations-add input {
+  grid-column: 1 / -1;
+}
+.task-relations-add select {
+  min-width: 0;
+  width: 100%;
+}
+.task-relations-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.task-relations-list > li {
+  border: 1px solid var(--border, #334155);
+  border-radius: 8px;
+  padding: 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+.task-relation-main {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+.task-relation-title {
+  justify-content: flex-start;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  text-align: left;
+  overflow-wrap: anywhere;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.task-relation-meta {
+  color: var(--muted, #b0becf);
+}
+.task-relation-candidate {
+  color: #e7bd79;
+}
+.task-relation-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: start;
+  justify-content: flex-end;
+}
+.task-relation-actions a {
+  padding: 4px;
+}
+.task-relation-evidence {
+  grid-column: 1 / -1;
+}
+.task-relation-evidence summary {
+  cursor: pointer;
+}
+.task-relation-evidence p {
+  margin: 6px 0 0;
+}
+.task-relation-inactive {
+  background: var(--surface, #17202b);
+}
+.task-relations-error {
+  color: #ffb4ab;
+  margin: 0;
+}
+.task-relations-history {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+@media (max-width: 600px) {
+  .task-relations-list > li {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .task-relation-actions {
+    justify-content: flex-start;
+  }
+}
